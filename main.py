@@ -36,7 +36,9 @@ def get_secret(project_id, secret_id, version_id="latest"):
         return None
 
 # --- Get Project ID and Secrets ---
-PROJECT_ID = os.environ.get('GCP_PROJECT')
+# The GCP_PROJECT env var is automatically set by Cloud Run.
+PROJECT_ID = os.environ.get('GCP_PROJECT') 
+# You should store your Gemini API Key as a secret named 'GEMINI_API_KEY'
 GEMINI_API_KEY = get_secret(PROJECT_ID, "GEMINI_API_KEY") if PROJECT_ID else os.environ.get('GEMINI_API_KEY_LOCAL')
 
 
@@ -44,7 +46,7 @@ def authenticate_with_secrets():
     """Authenticates with Google APIs using credentials from Secret Manager."""
     creds = None
     if not PROJECT_ID:
-        print("ERROR: GCP_PROJECT environment variable not set.")
+        print("ERROR: GCP_PROJECT environment variable not set. Running locally?")
         return None
 
     # Fetch the contents of the token file from Secret Manager
@@ -95,6 +97,7 @@ def get_email_intent_with_ai(email_text):
         JSON:
         """
         response = model.generate_content(prompt)
+        # Clean up the response to get a valid JSON string
         json_str = response.text.strip().replace('```json', '').replace('```', '').strip()
         return json.loads(json_str)
     except Exception as e:
@@ -111,7 +114,7 @@ def find_available_slots(service, calendar_id, preferences):
     now_et = now_utc.astimezone(ET)
     
     time_min_utc = now_utc.isoformat()
-    time_max_utc = (now_utc + timedelta(days=14)).isoformat()
+    time_max_utc = (now_utc + timedelta(days=14)).isoformat() # Look 14 days ahead
 
     events_result = service.events().list(calendarId=calendar_id, timeMin=time_min_utc,
                                           timeMax=time_max_utc, singleEvents=True,
@@ -136,12 +139,14 @@ def find_available_slots(service, calendar_id, preferences):
             
         day_to_check = (now_et + timedelta(days=day_offset))
         
+        # Skip if a specific day was requested and this isn't it
         if target_weekday is not None and day_to_check.weekday() != target_weekday:
             continue
 
         workday_start_et = ET.localize(datetime.combine(day_to_check.date(), time())) + timedelta(hours=WORK_START_HOUR_ET)
         workday_end_et = ET.localize(datetime.combine(day_to_check.date(), time())) + timedelta(hours=WORK_END_HOUR_ET)
         
+        # Adjust search window based on time_of_day preference
         if time_of_day == "morning":
             workday_end_et = min(workday_end_et, ET.localize(datetime.combine(day_to_check.date(), morning_end)))
         elif time_of_day == "afternoon":
@@ -160,20 +165,23 @@ def find_available_slots(service, calendar_id, preferences):
             for event in busy_slots:
                 event_start_str = event['start'].get('dateTime', event['start'].get('date'))
                 event_end_str = event['end'].get('dateTime', event['end'].get('date'))
-                if 'T' not in event_start_str: continue 
+                if 'T' not in event_start_str: continue # Skip all-day events
                 event_start_utc = datetime.fromisoformat(event_start_str.replace('Z', '+00:00'))
                 event_end_utc = datetime.fromisoformat(event_end_str.replace('Z', '+00:00'))
+                # Check for overlap
                 if max(slot_start_utc, event_start_utc) < min(slot_end_utc, event_end_utc):
                     is_available = False
                     break
             
+            # If the slot is free and we haven't found a slot for this day yet
             if is_available and day_to_check.date() not in found_days:
                 available_slots.append({'slot': slot_start_et, 'duration': duration_minutes})
                 found_days.add(day_to_check.date())
+                # If no specific day was asked for, we're done once we have 3 days
                 if not day_preference and len(found_days) >= 3:
                     break
             
-            current_slot_start_et += timedelta(minutes=30)
+            current_slot_start_et += timedelta(minutes=30) # Check next slot
             
     return available_slots[:3]
 
@@ -301,6 +309,7 @@ def process_email_request():
                 email_body += f"\nPlease reply with the option number that works best for you (e.g., 'Option 2')."
                 new_subject = f"Re: {subject} {hidden_data_for_snippet}"
                 
+                # Extract all emails from To and Cc fields
                 all_emails = set(re.findall(r'<([^>]+)>', original_to + original_cc))
                 all_emails.update(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', original_to + original_cc))
                 participants = [email for email in all_emails if email not in [agent_email, owner_email]]
@@ -309,6 +318,7 @@ def process_email_request():
                 
                 email_message = create_email(agent_email, to_field, cc_field, new_subject, email_body)
                 send_email(gmail_service, 'me', email_message)
+                # Mark the original message as read
                 gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
                 print(f"Sent time slot suggestions to {to_field}")
             else:
@@ -322,4 +332,6 @@ def process_email_request():
 
 # This block is essential for the server to start.
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    # Use the PORT environment variable provided by Cloud Run
+    port = int(os.environ.get("PORT", 8080))
+    app.run(debug=True, host='0.0.0.0', port=port)
