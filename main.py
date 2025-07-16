@@ -12,6 +12,7 @@ from flask import Flask, request
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+from google.cloud import secretmanager
 
 # --- Flask App Initialization ---
 app = Flask(__name__)
@@ -21,8 +22,26 @@ SCOPES = ['https://mail.google.com/', 'https://www.googleapis.com/auth/calendar'
 ET = pytz.timezone('America/New_York')
 WORK_START_HOUR_ET = 9.5  # 9:30 AM
 WORK_END_HOUR_ET = 18.0   # 6:00 PM
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+
+# --- Helper function to get secrets ---
+def get_secret(project_id, secret_id, version_id="latest"):
+    """Access the Secret Manager API."""
+    client = secretmanager.SecretManagerServiceClient()
+    name = f"projects/{project_id}/secrets/{secret_id}/versions/{version_id}"
+    response = client.access_secret_version(request={"name": name})
+    return response.payload.data.decode("UTF-8")
+
+# --- AI Configuration ---
+# Get the project ID from the environment (provided by Cloud Run)
+PROJECT_ID = os.environ.get('GCP_PROJECT') 
+if PROJECT_ID:
+    # Name of the secret in Secret Manager
+    GEMINI_API_KEY = get_secret(PROJECT_ID, "GEMINI_API_KEY") 
+else:
+    # Fallback for local testing (if you want to test AI locally)
+    GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE" 
 # --- End Configuration ---
+
 
 def authenticate_from_file():
     """Authenticates with Google APIs using the token.json file."""
@@ -179,7 +198,7 @@ def process_email_request():
     envelope = request.get_json()
     if not envelope or 'message' not in envelope:
         print('Invalid Pub/Sub message format. This may be a health check.')
-        return 'Bad Request: Invalid Pub/Sub message', 400
+        return 'Bad Request: Invalid Pub/Sub message', 200 # Return 200 for health checks
     
     agent_email = 'anntaoai@gmail.com'
     owner_email = 'anntaod@gmail.com'
@@ -287,6 +306,3 @@ def process_email_request():
         return "An error occurred.", 500
 
     return "Processing complete.", 200
-
-if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
