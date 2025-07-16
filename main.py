@@ -1,0 +1,292 @@
+# main.py
+# This is the production code for your Cloud Run service.
+
+import os
+import base64
+import re
+import json
+from datetime import datetime, timedelta, time
+import pytz
+import google.generativeai as genai
+from flask import Flask, request
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+
+# --- Flask App Initialization ---
+app = Flask(__name__)
+
+# --- Agent Configuration ---
+SCOPES = ['https://mail.google.com/', 'https://www.googleapis.com/auth/calendar']
+ET = pytz.timezone('America/New_York')
+WORK_START_HOUR_ET = 9.5  # 9:30 AM
+WORK_END_HOUR_ET = 18.0   # 6:00 PM
+GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE" # <--- PASTE YOUR API KEY HERE
+# --- End Configuration ---
+
+def authenticate_from_file():
+    """Authenticates with Google APIs using the token.json file."""
+    creds = None
+    if os.path.exists('token.json'):
+        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                print(f"Error refreshing token: {e}")
+                return None
+        else:
+            print("ERROR: token.json is missing or invalid in the cloud environment.")
+            return None
+    return creds
+
+def get_email_intent_with_ai(email_text):
+    """Uses Gemini to parse the user's intent from the email."""
+    if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_GEMINI_API_KEY_HERE":
+        print("ERROR: Gemini API key not configured. Using fallback (60 min default).")
+        return {'duration': 60, 'day_preference': None, 'time_of_day': None}
+        
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel('gemini-pro')
+
+    prompt = f"""
+    Read the following email snippet and extract the user's scheduling preferences.
+    Respond with a JSON object containing three keys: "duration", "day_preference", and "time_of_day".
+    - "duration" should be an integer in minutes (e.g., 30 or 60). Default to 60 if not specified.
+    - "day_preference" should be the requested day of the week (e.g., "Monday", "Wednesday", "Friday") or null if not specified.
+    - "time_of_day" should be "morning", "afternoon", or null if not specified. "Morning" is before 12 PM. "Afternoon" is 12 PM or later.
+    Email: "{email_text}"
+    JSON:
+    """
+    
+    try:
+        response = model.generate_content(prompt)
+        json_str = response.text.strip().replace('```json', '').replace('```', '').strip()
+        return json.loads(json_str)
+    except Exception as e:
+        print(f"AI parsing failed: {e}. Using default values.")
+        return {'duration': 60, 'day_preference': None, 'time_of_day': None}
+
+def find_available_slots(service, calendar_id, preferences):
+    """Finds available slots based on AI-parsed preferences."""
+    duration_minutes = preferences.get('duration', 60)
+    day_preference = preferences.get('day_preference')
+    time_of_day = preferences.get('time_of_day')
+
+    now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
+    now_et = now_utc.astimezone(ET)
+    
+    time_min_utc = now_utc.isoformat()
+    time_max_utc = (now_utc + timedelta(days=14)).isoformat()
+
+    events_result = service.events().list(calendarId=calendar_id, timeMin=time_min_utc,
+                                          timeMax=time_max_utc, singleEvents=True,
+                                          orderBy='startTime').execute()
+    busy_slots = events_result.get('items', [])
+
+    available_slots = []
+    found_days = set()
+    
+    morning_end = time(12, 0)
+    afternoon_start = time(12, 0)
+    
+    weekday_map = {
+        'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3,
+        'friday': 4, 'saturday': 5, 'sunday': 6
+    }
+    target_weekday = weekday_map.get(day_preference.lower()) if day_preference else None
+
+    for day_offset in range(1, 15):
+        if len(available_slots) >= 3:
+            break
+            
+        day_to_check = (now_et + timedelta(days=day_offset))
+        
+        if target_weekday is not None and day_to_check.weekday() != target_weekday:
+            continue
+
+        workday_start_et = ET.localize(datetime.combine(day_to_check.date(), time())) + timedelta(hours=WORK_START_HOUR_ET)
+        workday_end_et = ET.localize(datetime.combine(day_to_check.date(), time())) + timedelta(hours=WORK_END_HOUR_ET)
+        
+        if time_of_day == "morning":
+            workday_end_et = min(workday_end_et, ET.localize(datetime.combine(day_to_check.date(), morning_end)))
+        elif time_of_day == "afternoon":
+            workday_start_et = max(workday_start_et, ET.localize(datetime.combine(day_to_check.date(), afternoon_start)))
+
+        current_slot_start_et = workday_start_et
+        
+        while current_slot_start_et + timedelta(minutes=duration_minutes) <= workday_end_et:
+            slot_start_et = current_slot_start_et
+            slot_end_et = slot_start_et + timedelta(minutes=duration_minutes)
+            
+            slot_start_utc = slot_start_et.astimezone(pytz.utc)
+            slot_end_utc = slot_end_et.astimezone(pytz.utc)
+
+            is_available = True
+            for event in busy_slots:
+                event_start_str = event['start'].get('dateTime', event['start'].get('date'))
+                event_end_str = event['end'].get('dateTime', event['end'].get('date'))
+                if 'T' not in event_start_str: continue 
+                event_start_utc = datetime.fromisoformat(event_start_str.replace('Z', '+00:00'))
+                event_end_utc = datetime.fromisoformat(event_end_str.replace('Z', '+00:00'))
+                if max(slot_start_utc, event_start_utc) < min(slot_end_utc, event_end_utc):
+                    is_available = False
+                    break
+            
+            if is_available and day_to_check.date() not in found_days:
+                available_slots.append({'slot': slot_start_et, 'duration': duration_minutes})
+                found_days.add(day_to_check.date())
+                if not day_preference and len(found_days) >= 3:
+                    break
+            
+            current_slot_start_et += timedelta(minutes=30)
+            
+    return available_slots[:3]
+
+def create_email(sender, to, cc, subject, message_text):
+  """Create a message for an email."""
+  message = f"From: {sender}\nTo: {to}\nCc: {cc}\nSubject: {subject}\n\n{message_text}"
+  return {'raw': base64.urlsafe_b64encode(message.encode()).decode()}
+
+def send_email(service, user_id, message):
+  """Send an email message."""
+  try:
+    message = (service.users().messages().send(userId=user_id, body=message).execute())
+    return message
+  except Exception as e:
+    print(f'An error occurred while sending email: {e}')
+    return None
+
+def create_calendar_event(service, calendar_id, summary, start_time_et, duration_minutes, attendees):
+    """Creates an event in the owner's calendar."""
+    start_utc = start_time_et.astimezone(pytz.utc)
+    end_utc = start_utc + timedelta(minutes=duration_minutes)
+    
+    event = {
+        'summary': summary,
+        'start': {'dateTime': start_utc.isoformat(), 'timeZone': 'America/New_York'},
+        'end': {'dateTime': end_utc.isoformat(), 'timeZone': 'America/New_York'},
+        'attendees': [{'email': email} for email in attendees],
+    }
+    created_event = service.events().insert(calendarId=calendar_id, body=event, sendNotifications=True).execute()
+    print(f'Event created: {created_event.get("htmlLink")}')
+
+@app.route('/', methods=['POST'])
+def process_email_request():
+    """Entry point for all requests, triggered by Pub/Sub."""
+    envelope = request.get_json()
+    if not envelope or 'message' not in envelope:
+        print('Invalid Pub/Sub message format. This may be a health check.')
+        return 'Bad Request: Invalid Pub/Sub message', 400
+    
+    agent_email = 'anntaoai@gmail.com'
+    owner_email = 'anntaod@gmail.com'
+    owner_name = 'Anntao'
+
+    creds = authenticate_from_file()
+    if not creds:
+        return "Authentication failed.", 500
+
+    try:
+        gmail_service = build('gmail', 'v1', credentials=creds)
+        calendar_service = build('calendar', 'v3', credentials=creds)
+    except Exception as e:
+        print(f"CRITICAL: Failed to build API services. Error: {e}")
+        return "Service build failed.", 500
+
+    pubsub_message = envelope['message']
+    if 'data' not in pubsub_message:
+        print("No data in Pub/Sub message.")
+        return "No data in message", 200
+
+    try:
+        data = json.loads(base64.b64decode(pubsub_message['data']).decode('utf-8'))
+        history_id = data['historyId']
+        
+        history = gmail_service.users().history().list(userId='me', startHistoryId=history_id).execute()
+        if 'history' not in history:
+            print("No new message history found.")
+            return "No new history.", 200
+
+        messages_added = history['history'][0].get('messagesAdded', [])
+        if not messages_added:
+            print("No message was added in this history event.")
+            return "No message added.", 200
+
+        msg_id = messages_added[0]['message']['id']
+        if 'UNREAD' not in messages_added[0]['message'].get('labelIds', []):
+            print(f"Message {msg_id} was not unread. Ignoring.")
+            return "Message already read.", 200
+
+        message = gmail_service.users().messages().get(userId='me', id=msg_id).execute()
+        
+        headers = message['payload']['headers']
+        subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
+        snippet = message.get('snippet', '')
+
+        original_to = next((h['value'] for h in headers if h['name'].lower() == 'to'), '')
+        original_cc = next((h['value'] for h in headers if h['name'].lower() == 'cc'), '')
+        if owner_email not in (original_to + original_cc):
+             print(f"Owner ({owner_email}) not in recipients. Ignoring email.")
+             gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
+             return "Owner not in thread, request ignored.", 200
+
+        if "Re:" in subject and "AI assistant" in snippet:
+            body_data = message['payload']['parts'][0]['body'].get('data')
+            body = base64.urlsafe_b64decode(body_data).decode('utf-8') if body_data else ""
+            option_match = re.search(r'Option (\d)', body, re.IGNORECASE)
+            if option_match:
+                chosen_option = int(option_match.group(1))
+                hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', snippet)
+                if len(hidden_data_matches) >= chosen_option:
+                    event_data = json.loads(hidden_data_matches[chosen_option - 1])
+                    start_time_et = ET.localize(datetime.fromisoformat(event_data['start']))
+                    duration = event_data['duration']
+                    
+                    original_from = next((h['value'] for h in headers if h['name'].lower() == 'from'), '')
+                    participants = [email.strip() for email in re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', original_from)]
+                    attendees = [owner_email] + participants
+
+                    create_calendar_event(calendar_service, owner_email, f"Meeting with {owner_name}", start_time_et, duration, attendees)
+                    gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
+                    print(f"Event scheduled with {', '.join(participants)}")
+        
+        else:
+            preferences = get_email_intent_with_ai(snippet)
+            available_slots = find_available_slots(calendar_service, owner_email, preferences)
+            
+            if available_slots:
+                email_body = f"Hello,\n\nI'm the AI assistant for {owner_name}. I can help schedule a {preferences.get('duration', 60)}-minute meeting. Based on the request, here are available slots from {owner_name}'s calendar:\n\n"
+                hidden_data_for_snippet = ""
+                for i, slot_data in enumerate(available_slots):
+                    slot_et = slot_data['slot']
+                    email_body += f"Option {i+1}: {slot_et.strftime('%A, %B %d at %I:%M %p ET')}\n"
+                    hidden_info = json.dumps({'start': slot_et.isoformat(), 'duration': slot_data['duration']})
+                    hidden_data_for_snippet += f"<!-- data: {hidden_info} -->"
+
+                email_body += f"\nPlease reply with the option number that works best for you (e.g., 'Option 2')."
+                new_subject = f"Re: {subject} {hidden_data_for_snippet}"
+                
+                all_emails = set(re.findall(r'<([^>]+)>', original_to + original_cc))
+                all_emails.update(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', original_to + original_cc))
+                participants = [email for email in all_emails if email not in [agent_email, owner_email]]
+                to_field = ", ".join(participants)
+                cc_field = owner_email
+                
+                email_message = create_email(agent_email, to_field, cc_field, new_subject, email_body)
+                send_email(gmail_service, 'me', email_message)
+                gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
+                print(f"Sent time slot suggestions to {to_field}")
+            else:
+                 print("No available slots found matching the criteria.")
+
+    except Exception as e:
+        print(f"An error occurred during processing: {e}")
+        return "An error occurred.", 500
+
+    return "Processing complete.", 200
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
