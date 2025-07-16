@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, time
 import pytz
 import google.generativeai as genai
 from flask import Flask, request
+import google.auth
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
@@ -36,8 +37,13 @@ def get_secret(project_id, secret_id, version_id="latest"):
         return None
 
 # --- Get Project ID and Secrets ---
-# The GCP_PROJECT env var is automatically set by Cloud Run.
-PROJECT_ID = os.environ.get('GCP_PROJECT') 
+try:
+    _, PROJECT_ID = google.auth.default()
+    print(f"Successfully determined Project ID: {PROJECT_ID}")
+except google.auth.exceptions.DefaultCredentialsError:
+    print("Could not automatically determine project ID. Is this running locally?")
+    PROJECT_ID = None
+
 # You should store your Gemini API Key as a secret named 'GEMINI_API_KEY'
 GEMINI_API_KEY = get_secret(PROJECT_ID, "GEMINI_API_KEY") if PROJECT_ID else os.environ.get('GEMINI_API_KEY_LOCAL')
 
