@@ -21,7 +21,7 @@ SCOPES = ['https://mail.google.com/', 'https://www.googleapis.com/auth/calendar'
 ET = pytz.timezone('America/New_York')
 WORK_START_HOUR_ET = 9.5  # 9:30 AM
 WORK_END_HOUR_ET = 18.0   # 6:00 PM
-GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE" # <--- PASTE YOUR API KEY HERE
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 # --- End Configuration ---
 
 def authenticate_from_file():
