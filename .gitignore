@@ -1,0 +1,14 @@
+# Credentials and Tokens
+token.json
+credentials.json
+*.json
+
+# Python cache and virtual environments
+__pycache__/
+*.pyc
+.env
+venv/
+env/
+
+# Google Cloud specific files
+.gcloud/
