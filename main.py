@@ -25,62 +25,75 @@ WORK_END_HOUR_ET = 18.0   # 6:00 PM
 
 # --- Helper function to get secrets ---
 def get_secret(project_id, secret_id, version_id="latest"):
-    """Access the Secret Manager API."""
-    client = secretmanager.SecretManagerServiceClient()
-    name = f"projects/{project_id}/secrets/{secret_id}/versions/{version_id}"
-    response = client.access_secret_version(request={"name": name})
-    return response.payload.data.decode("UTF-8")
+    """Access the Secret Manager API to retrieve a secret."""
+    try:
+        client = secretmanager.SecretManagerServiceClient()
+        name = f"projects/{project_id}/secrets/{secret_id}/versions/{version_id}"
+        response = client.access_secret_version(request={"name": name})
+        return response.payload.data.decode("UTF-8")
+    except Exception as e:
+        print(f"ERROR: Could not access secret: {secret_id}. Error: {e}")
+        return None
 
-# --- AI Configuration ---
-# Get the project ID from the environment (provided by Cloud Run)
-PROJECT_ID = os.environ.get('GCP_PROJECT') 
-if PROJECT_ID:
-    # Name of the secret in Secret Manager
-    GEMINI_API_KEY = get_secret(PROJECT_ID, "GEMINI_API_KEY") 
-else:
-    # Fallback for local testing (if you want to test AI locally)
-    GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE" 
-# --- End Configuration ---
+# --- Get Project ID and Secrets ---
+PROJECT_ID = os.environ.get('GCP_PROJECT')
+GEMINI_API_KEY = get_secret(PROJECT_ID, "GEMINI_API_KEY") if PROJECT_ID else os.environ.get('GEMINI_API_KEY_LOCAL')
 
 
-def authenticate_from_file():
-    """Authenticates with Google APIs using the token.json file."""
+def authenticate_with_secrets():
+    """Authenticates with Google APIs using credentials from Secret Manager."""
     creds = None
-    if os.path.exists('token.json'):
-        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    if not PROJECT_ID:
+        print("ERROR: GCP_PROJECT environment variable not set.")
+        return None
+
+    # Fetch the contents of the token file from Secret Manager
+    token_json_str = get_secret(PROJECT_ID, "agent-token-json")
     
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except Exception as e:
-                print(f"Error refreshing token: {e}")
-                return None
-        else:
-            print("ERROR: token.json is missing or invalid in the cloud environment.")
+    if not token_json_str:
+        print("ERROR: Could not retrieve token from Secret Manager.")
+        return None
+
+    try:
+        # Load the credentials directly from the secret's string content
+        creds_info = json.loads(token_json_str)
+        creds = Credentials.from_authorized_user_info(creds_info, SCOPES)
+    except Exception as e:
+        print(f"ERROR: Could not load credentials from secret data. Error: {e}")
+        return None
+
+    # Check if the token is valid or needs to be refreshed
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            print("Token expired, attempting to refresh...")
+            creds.refresh(Request())
+            # Note: A mechanism would be needed here to update the secret with the new token
+            # if the refresh token is long-lived. For now, we proceed with the refreshed token.
+            print("Token refreshed successfully for this session.")
+        except Exception as e:
+            print(f"ERROR: Could not refresh token. A new token may need to be generated manually. Error: {e}")
             return None
+            
     return creds
 
 def get_email_intent_with_ai(email_text):
     """Uses Gemini to parse the user's intent from the email."""
-    if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_GEMINI_API_KEY_HERE":
-        print("ERROR: Gemini API key not configured. Using fallback (60 min default).")
+    if not GEMINI_API_KEY:
+        print("WARN: Gemini API key is not configured. Using fallback (60 min default).")
         return {'duration': 60, 'day_preference': None, 'time_of_day': None}
         
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-pro')
-
-    prompt = f"""
-    Read the following email snippet and extract the user's scheduling preferences.
-    Respond with a JSON object containing three keys: "duration", "day_preference", and "time_of_day".
-    - "duration" should be an integer in minutes (e.g., 30 or 60). Default to 60 if not specified.
-    - "day_preference" should be the requested day of the week (e.g., "Monday", "Wednesday", "Friday") or null if not specified.
-    - "time_of_day" should be "morning", "afternoon", or null if not specified. "Morning" is before 12 PM. "Afternoon" is 12 PM or later.
-    Email: "{email_text}"
-    JSON:
-    """
-    
     try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel('gemini-pro')
+        prompt = f"""
+        Read the following email snippet and extract the user's scheduling preferences.
+        Respond with a JSON object containing three keys: "duration", "day_preference", and "time_of_day".
+        - "duration" should be an integer in minutes (e.g., 30 or 60). Default to 60 if not specified.
+        - "day_preference" should be the requested day of the week (e.g., "Monday", "Wednesday", "Friday") or null if not specified.
+        - "time_of_day" should be "morning", "afternoon", or null if not specified. "Morning" is before 12 PM. "Afternoon" is 12 PM or later.
+        Email: "{email_text}"
+        JSON:
+        """
         response = model.generate_content(prompt)
         json_str = response.text.strip().replace('```json', '').replace('```', '').strip()
         return json.loads(json_str)
@@ -198,13 +211,13 @@ def process_email_request():
     envelope = request.get_json()
     if not envelope or 'message' not in envelope:
         print('Invalid Pub/Sub message format. This may be a health check.')
-        return 'Bad Request: Invalid Pub/Sub message', 200 # Return 200 for health checks
+        return 'OK', 200 # Return 200 for health checks
     
     agent_email = 'anntaoai@gmail.com'
     owner_email = 'anntaod@gmail.com'
     owner_name = 'Anntao'
 
-    creds = authenticate_from_file()
+    creds = authenticate_with_secrets()
     if not creds:
         return "Authentication failed.", 500
 
@@ -306,3 +319,7 @@ def process_email_request():
         return "An error occurred.", 500
 
     return "Processing complete.", 200
+
+# This block is essential for the server to start.
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
