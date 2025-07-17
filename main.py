@@ -326,7 +326,6 @@ def process_email_request():
 
         subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
         
-        # --- FIX: Use the new function to get the full body ---
         full_email_text = get_full_email_body(message['payload'])
         
         message_id_header = next((h['value'] for h in headers if h['name'].lower() == 'message-id'), None)
@@ -343,7 +342,6 @@ def process_email_request():
 
         hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', full_email_text)
 
-        # --- FIX: Simplified and more robust reply detection ---
         if hidden_data_matches and owner_email not in original_from_header:
             print("Detected reply to agent. Attempting to schedule event.")
             possible_slots_text = ""
