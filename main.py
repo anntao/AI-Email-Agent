@@ -14,6 +14,8 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from google.cloud import secretmanager
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 # --- Flask App Initialization ---
 app = Flask(__name__)
@@ -84,8 +86,8 @@ def authenticate_with_secrets():
             
     return creds
 
-def get_email_intent_with_ai(email_text):
-    """Uses Gemini to parse the user's intent from the email."""
+def get_email_intent_with_ai(email_thread_text):
+    """Uses Gemini to parse the user's intent from the full email thread."""
     if not GEMINI_API_KEY:
         print("WARN: Gemini API key is not configured. Using fallback (60 min default).")
         return {'duration': 60, 'day_preference': None, 'time_of_day': None}
@@ -94,12 +96,18 @@ def get_email_intent_with_ai(email_text):
         genai.configure(api_key=GEMINI_API_KEY)
         model = genai.GenerativeModel('gemini-pro')
         prompt = f"""
-        Read the following email snippet and extract the user's scheduling preferences.
-        Respond with a JSON object containing three keys: "duration", "day_preference", and "time_of_day".
-        - "duration" should be an integer in minutes (e.g., 30 or 60). Default to 60 if not specified.
-        - "day_preference" should be the requested day of the week (e.g., "Monday", "Wednesday", "Friday") or null if not specified.
-        - "time_of_day" should be "morning", "afternoon", or null if not specified. "Morning" is before 12 PM. "Afternoon" is 12 PM or later.
-        Email: "{email_text}"
+        Analyze the following email thread to determine scheduling preferences.
+        Your goal is to be a helpful assistant.
+
+        1.  **Duration**: Find the meeting duration in minutes (e.g., 30 or 60). Default to 60.
+        2.  **Day Preference**: Identify a specific day of the week if mentioned (e.g., "Monday", "Friday").
+        3.  **Time of Day**: Identify a time preference ("morning", "afternoon").
+
+        Return a JSON object with keys: "duration", "day_preference", "time_of_day".
+        If a value isn't specified, use null.
+
+        Email Thread: "{email_thread_text}"
+
         JSON:
         """
         response = model.generate_content(prompt)
@@ -111,7 +119,7 @@ def get_email_intent_with_ai(email_text):
         return {'duration': 60, 'day_preference': None, 'time_of_day': None}
 
 def find_available_slots(service, calendar_id, preferences):
-    """Finds available slots based on AI-parsed preferences."""
+    """Finds available slots based on AI-parsed preferences, skipping weekends."""
     duration_minutes = preferences.get('duration', 60)
     day_preference = preferences.get('day_preference')
     time_of_day = preferences.get('time_of_day')
@@ -145,6 +153,10 @@ def find_available_slots(service, calendar_id, preferences):
             
         day_to_check = (now_et + timedelta(days=day_offset))
         
+        # --- NEW: Skip weekends ---
+        if day_to_check.weekday() >= 5: # Monday is 0, Saturday is 5, Sunday is 6
+            continue
+            
         # Skip if a specific day was requested and this isn't it
         if target_weekday is not None and day_to_check.weekday() != target_weekday:
             continue
@@ -179,22 +191,28 @@ def find_available_slots(service, calendar_id, preferences):
                     is_available = False
                     break
             
-            # If the slot is free and we haven't found a slot for this day yet
             if is_available and day_to_check.date() not in found_days:
                 available_slots.append({'slot': slot_start_et, 'duration': duration_minutes})
                 found_days.add(day_to_check.date())
-                # If no specific day was asked for, we're done once we have 3 days
                 if not day_preference and len(found_days) >= 3:
                     break
             
-            current_slot_start_et += timedelta(minutes=30) # Check next slot
+            current_slot_start_et += timedelta(minutes=30)
             
     return available_slots[:3]
 
-def create_email(sender, to, cc, subject, message_text):
-  """Create a message for an email."""
-  message = f"From: {sender}\nTo: {to}\nCc: {cc}\nSubject: {subject}\n\n{message_text}"
-  return {'raw': base64.urlsafe_b64encode(message.encode()).decode()}
+def create_threaded_email(sender, to, cc, subject, html_body, in_reply_to, references):
+    """Creates a MIME message that will reply in the same thread."""
+    message = MIMEMultipart('alternative')
+    message['to'] = to
+    message['from'] = sender
+    message['cc'] = cc
+    message['subject'] = subject
+    message['In-Reply-To'] = in_reply_to
+    message['References'] = references
+    
+    message.attach(MIMEText(html_body, 'html'))
+    return {'raw': base64.urlsafe_b64encode(message.as_bytes()).decode()}
 
 def send_email(service, user_id, message):
   """Send an email message."""
@@ -242,20 +260,26 @@ def process_email_request():
         print(f"CRITICAL: Failed to build API services. Error: {e}")
         return "Service build failed.", 500
 
-    # New, more robust method to find the email
     try:
-        # Instead of using history, search for the newest unread message.
+        # Search for the newest unread message.
         list_response = gmail_service.users().messages().list(userId='me', q='is:unread', maxResults=1).execute()
         if not list_response.get('messages'):
             print("No new unread messages found.")
             return "No unread messages.", 200
         
         msg_id = list_response['messages'][0]['id']
-        message = gmail_service.users().messages().get(userId='me', id=msg_id).execute()
+        message = gmail_service.users().messages().get(userId='me', id=msg_id, format='full').execute()
         
         headers = message['payload']['headers']
         subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
         snippet = message.get('snippet', '')
+        
+        # --- NEW: Get Message-ID and References for proper threading ---
+        message_id_header = next((h['value'] for h in headers if h['name'].lower() == 'message-id'), None)
+        references_header = next((h['value'] for h in headers if h['name'].lower() == 'references'), '')
+
+        # Construct the new references header
+        new_references = f"{references_header} {message_id_header}".strip()
 
         original_to = next((h['value'] for h in headers if h['name'].lower() == 'to'), '')
         original_cc = next((h['value'] for h in headers if h['name'].lower() == 'cc'), '')
@@ -264,14 +288,43 @@ def process_email_request():
              gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
              return "Owner not in thread, request ignored.", 200
 
+        # --- AI-powered Reply Parsing ---
         if "Re:" in subject and "AI assistant" in snippet:
-            body_data = message['payload']['parts'][0]['body'].get('data')
-            body = base64.urlsafe_b64decode(body_data).decode('utf-8') if body_data else ""
-            option_match = re.search(r'Option (\d)', body, re.IGNORECASE)
-            if option_match:
-                chosen_option = int(option_match.group(1))
-                hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', snippet)
-                if len(hidden_data_matches) >= chosen_option:
+            hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', str(message['payload']))
+            
+            body_parts = message['payload'].get('parts', [])
+            body = ""
+            if body_parts:
+                body_data = body_parts[0]['body'].get('data')
+                body = base64.urlsafe_b64decode(body_data).decode('utf-8') if body_data else ""
+            
+            if hidden_data_matches:
+                possible_slots_text = ""
+                for i, hidden_info_str in enumerate(hidden_data_matches):
+                    slot_data = json.loads(hidden_info_str)
+                    start_time_et = ET.localize(datetime.fromisoformat(slot_data['start']))
+                    possible_slots_text += f"Option {i+1}: {start_time_et.strftime('%A, %B %d at %I:%M %p ET')} for {slot_data['duration']} minutes.\n"
+                
+                genai.configure(api_key=GEMINI_API_KEY)
+                model = genai.GenerativeModel('gemini-pro')
+                prompt = f"""
+                Read the user's reply to determine which option they chose for the meeting.
+                The options offered were:
+                {possible_slots_text}
+
+                The user's reply is: "{body}"
+
+                Respond with a JSON object containing one key: "chosen_option_number".
+                The value should be the integer of the chosen option (e.g., 1, 2, or 3).
+                If the user did not clearly choose an option, respond with null.
+                JSON:
+                """
+                response = model.generate_content(prompt)
+                json_str = response.text.strip().replace('```json', '').replace('```', '').strip()
+                choice_data = json.loads(json_str)
+                chosen_option = choice_data.get('chosen_option_number')
+
+                if chosen_option and len(hidden_data_matches) >= chosen_option:
                     event_data = json.loads(hidden_data_matches[chosen_option - 1])
                     start_time_et = ET.localize(datetime.fromisoformat(event_data['start']))
                     duration = event_data['duration']
@@ -284,32 +337,52 @@ def process_email_request():
                     gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
                     print(f"Event scheduled with {', '.join(participants)}")
         
+        # --- AI-powered Initial Request ---
         else:
             preferences = get_email_intent_with_ai(snippet)
             available_slots = find_available_slots(calendar_service, owner_email, preferences)
             
             if available_slots:
-                email_body = f"Hello,\n\nI'm the AI assistant for {owner_name}. I can help schedule a {preferences.get('duration', 60)}-minute meeting. Based on the request, here are available slots from {owner_name}'s calendar:\n\n"
-                hidden_data_for_snippet = ""
+                slots_text = ""
+                hidden_data_for_body = ""
                 for i, slot_data in enumerate(available_slots):
                     slot_et = slot_data['slot']
-                    email_body += f"Option {i+1}: {slot_et.strftime('%A, %B %d at %I:%M %p ET')}\n"
+                    slots_text += f"- {slot_et.strftime('%A, %B %d at %I:%M %p ET')}\n"
                     hidden_info = json.dumps({'start': slot_et.isoformat(), 'duration': slot_data['duration']})
-                    hidden_data_for_snippet += f"<!-- data: {hidden_info} -->"
-
-                email_body += f"\nPlease reply with the option number that works best for you (e.g., 'Option 2')."
-                new_subject = f"Re: {subject} {hidden_data_for_snippet}"
+                    hidden_data_for_body += f"<!-- data: {hidden_info} -->\n"
                 
-                # Extract all emails from To and Cc fields
+                genai.configure(api_key=GEMINI_API_KEY)
+                model = genai.GenerativeModel('gemini-pro')
+                prompt = f"""
+                You are an AI assistant helping schedule a meeting for {owner_name}.
+                You have found the following available time slots:
+                {slots_text}
+
+                Write a brief, friendly, and natural-sounding email to propose these times.
+                Do NOT ask the user to "choose an option". Instead, phrase it conversationally, like "Let me know if any of these times work for you."
+                Keep it concise and professional.
+                """
+                email_response = model.generate_content(prompt)
+                email_body_text = email_response.text
+
+                html_body = f"""
+                <html><body>
+                <p>{email_body_text.replace(os.linesep, '<br>')}</p>
+                {hidden_data_for_body}
+                </body></html>
+                """
+
+                # --- NEW: Clean subject for replies ---
+                clean_subject = f"Re: {subject.replace('Re: ', '')}"
+                
                 all_emails = set(re.findall(r'<([^>]+)>', original_to + original_cc))
                 all_emails.update(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', original_to + original_cc))
                 participants = [email for email in all_emails if email not in [agent_email, owner_email]]
                 to_field = ", ".join(participants)
                 cc_field = owner_email
                 
-                email_message = create_email(agent_email, to_field, cc_field, new_subject, email_body)
+                email_message = create_threaded_email(agent_email, to_field, cc_field, clean_subject, html_body, in_reply_to=message_id_header, references=new_references)
                 send_email(gmail_service, 'me', email_message)
-                # Mark the original message as read
                 gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
                 print(f"Sent time slot suggestions to {to_field}")
             else:
