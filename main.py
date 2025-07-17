@@ -242,30 +242,15 @@ def process_email_request():
         print(f"CRITICAL: Failed to build API services. Error: {e}")
         return "Service build failed.", 500
 
-    pubsub_message = envelope['message']
-    if 'data' not in pubsub_message:
-        print("No data in Pub/Sub message.")
-        return "No data in message", 200
-
+    # New, more robust method to find the email
     try:
-        data = json.loads(base64.b64decode(pubsub_message['data']).decode('utf-8'))
-        history_id = data['historyId']
+        # Instead of using history, search for the newest unread message.
+        list_response = gmail_service.users().messages().list(userId='me', q='is:unread', maxResults=1).execute()
+        if not list_response.get('messages'):
+            print("No new unread messages found.")
+            return "No unread messages.", 200
         
-        history = gmail_service.users().history().list(userId='me', startHistoryId=history_id).execute()
-        if 'history' not in history:
-            print("No new message history found.")
-            return "No new history.", 200
-
-        messages_added = history['history'][0].get('messagesAdded', [])
-        if not messages_added:
-            print("No message was added in this history event.")
-            return "No message added.", 200
-
-        msg_id = messages_added[0]['message']['id']
-        if 'UNREAD' not in messages_added[0]['message'].get('labelIds', []):
-            print(f"Message {msg_id} was not unread. Ignoring.")
-            return "Message already read.", 200
-
+        msg_id = list_response['messages'][0]['id']
         message = gmail_service.users().messages().get(userId='me', id=msg_id).execute()
         
         headers = message['payload']['headers']
