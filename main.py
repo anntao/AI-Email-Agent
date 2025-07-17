@@ -236,9 +236,8 @@ def get_full_email_body(payload):
     body = ""
     if 'parts' in payload:
         for part in payload['parts']:
-            body += get_full_email_body(part) # Recurse
+            body += get_full_email_body(part)
     elif payload.get('body') and payload['body'].get('data'):
-        # This is a single part, decode it
         data = payload['body']['data']
         try:
             body += base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')
@@ -344,13 +343,13 @@ def process_email_request():
 
         if hidden_data_matches and owner_email not in original_from_header:
             print("Detected reply to agent. Attempting to schedule event.")
+            
             possible_slots_text = ""
             for i, hidden_info_str in enumerate(hidden_data_matches):
                 slot_data = json.loads(hidden_info_str)
                 start_time_et = ET.localize(datetime.fromisoformat(slot_data['start']))
                 possible_slots_text += f"Option {i+1}: {start_time_et.strftime('%A, %B %d at %I:%M %p ET')} for {slot_data['duration']} minutes.\n"
             
-            gemini_api_key = os.environ.get("GEMINI_API_KEY")
             genai.configure(api_key=gemini_api_key)
             model = genai.GenerativeModel('gemini-1.5-flash-latest')
             prompt = f"""
@@ -381,10 +380,12 @@ def process_email_request():
 
                 create_calendar_event(calendar_service, owner_email, f"Meeting: {subject.replace('Re: ', '')}", start_time_et, duration, attendees)
                 print(f"Event scheduled with {', '.join(attendees)}")
+            else:
+                 print("Could not determine user's choice from reply. Will re-suggest.")
+                 # Fallthrough to initial request logic is intended here if choice is unclear
         
-        else:
+        if not (hidden_data_matches and owner_email not in original_from_header):
             print("Detected initial request. Finding slots.")
-            gemini_api_key = os.environ.get("GEMINI_API_KEY")
             preferences = get_email_intent_with_ai(full_email_text, datetime.now(ET), gemini_api_key)
             available_slots = find_available_slots(calendar_service, owner_email, preferences)
             
