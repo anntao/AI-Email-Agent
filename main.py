@@ -228,21 +228,22 @@ def create_calendar_event(service, calendar_id, summary, start_time_et, duration
     created_event = service.events().insert(calendarId=calendar_id, body=event, sendNotifications=True).execute()
     print(f'Event created: {created_event.get("htmlLink")}')
 
-def get_full_email_text(payload):
-    """Recursively extracts all plain text from an email payload."""
+def get_full_email_body(payload):
+    """
+    Recursively decodes and extracts all plain text and html content from an email payload.
+    This is necessary to find the hidden data comments in replies.
+    """
     body = ""
-    if payload.get('body') and payload['body'].get('data'):
-        data = payload['body']['data']
-        body += base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')
-    
     if 'parts' in payload:
         for part in payload['parts']:
-            if part['mimeType'] == 'text/plain':
-                if part.get('body') and part['body'].get('data'):
-                    data = part['body']['data']
-                    body += base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')
-            elif 'parts' in part:
-                 body += get_full_email_text(part)
+            body += get_full_email_body(part) # Recurse
+    elif payload.get('body') and payload['body'].get('data'):
+        # This is a single part, decode it
+        data = payload['body']['data']
+        try:
+            body += base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')
+        except Exception as e:
+            print(f"Could not decode email part: {e}")
     return body
 
 @app.route('/', methods=['POST'])
@@ -254,7 +255,6 @@ def process_email_request():
         print('Invalid Pub/Sub message format. This may be a health check.')
         return 'OK', 200
     
-    # --- FIX: Moved environment discovery and client initialization inside the request handler ---
     try:
         _, project_id = google.auth.default()
         db = firestore.Client(project=project_id)
@@ -264,20 +264,19 @@ def process_email_request():
 
     gemini_api_key = os.environ.get("GEMINI_API_KEY")
     
-    # --- FIX: Use Firestore for robust deduplication ---
     try:
         data = json.loads(base64.b64decode(envelope['message']['data']).decode('utf-8'))
-        history_id = str(data['historyId']) # Ensure historyId is a string
+        history_id = str(data['historyId'])
         doc_ref = db.collection('processed_history').document(history_id)
         
         @firestore.transactional
         def check_and_set_history(transaction, doc_ref):
             snapshot = doc_ref.get(transaction=transaction)
             if snapshot.exists:
-                return True # Indicates duplicate
+                return True
             else:
                 transaction.set(doc_ref, {'timestamp': firestore.SERVER_TIMESTAMP})
-                return False # Indicates not a duplicate
+                return False
 
         transaction = db.transaction()
         is_duplicate = check_and_set_history(transaction, doc_ref)
@@ -315,7 +314,6 @@ def process_email_request():
         
         msg_id = list_response['messages'][0]['id']
         
-        # --- FIX: Mark as read immediately to avoid race conditions ---
         gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
         
         message = gmail_service.users().messages().get(userId='me', id=msg_id, format='full').execute()
@@ -327,7 +325,9 @@ def process_email_request():
             return "Agent message ignored.", 200
 
         subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
-        full_email_text = get_full_email_text(message['payload'])
+        
+        # --- FIX: Use the new function to get the full body ---
+        full_email_text = get_full_email_body(message['payload'])
         
         message_id_header = next((h['value'] for h in headers if h['name'].lower() == 'message-id'), None)
         references_header = next((h['value'] for h in headers if h['name'].lower() == 'references'), '')
@@ -343,10 +343,8 @@ def process_email_request():
 
         hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', full_email_text)
 
-        # --- FIX: Improved logic to handle replies ---
-        is_reply_to_agent = "AI assistant" in full_email_text and hidden_data_matches and owner_email not in original_from_header
-
-        if is_reply_to_agent:
+        # --- FIX: Simplified and more robust reply detection ---
+        if hidden_data_matches and owner_email not in original_from_header:
             print("Detected reply to agent. Attempting to schedule event.")
             possible_slots_text = ""
             for i, hidden_info_str in enumerate(hidden_data_matches):
@@ -354,6 +352,7 @@ def process_email_request():
                 start_time_et = ET.localize(datetime.fromisoformat(slot_data['start']))
                 possible_slots_text += f"Option {i+1}: {start_time_et.strftime('%A, %B %d at %I:%M %p ET')} for {slot_data['duration']} minutes.\n"
             
+            gemini_api_key = os.environ.get("GEMINI_API_KEY")
             genai.configure(api_key=gemini_api_key)
             model = genai.GenerativeModel('gemini-1.5-flash-latest')
             prompt = f"""
@@ -376,7 +375,6 @@ def process_email_request():
                 start_time_et = ET.localize(datetime.fromisoformat(event_data['start']))
                 duration = event_data['duration']
                 
-                # --- FIX: Correct participant parsing ---
                 all_emails_str = original_to + "," + original_cc + "," + original_from_header
                 attendees = list(set(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', all_emails_str)))
                 if owner_email not in attendees:
@@ -388,6 +386,7 @@ def process_email_request():
         
         else:
             print("Detected initial request. Finding slots.")
+            gemini_api_key = os.environ.get("GEMINI_API_KEY")
             preferences = get_email_intent_with_ai(full_email_text, datetime.now(ET), gemini_api_key)
             available_slots = find_available_slots(calendar_service, owner_email, preferences)
             
