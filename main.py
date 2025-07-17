@@ -254,6 +254,7 @@ def process_email_request():
         print('Invalid Pub/Sub message format. This may be a health check.')
         return 'OK', 200
     
+    # --- FIX: Moved environment discovery and client initialization inside the request handler ---
     try:
         _, project_id = google.auth.default()
         db = firestore.Client(project=project_id)
@@ -263,19 +264,20 @@ def process_email_request():
 
     gemini_api_key = os.environ.get("GEMINI_API_KEY")
     
+    # --- FIX: Use Firestore for robust deduplication ---
     try:
         data = json.loads(base64.b64decode(envelope['message']['data']).decode('utf-8'))
-        history_id = str(data['historyId'])
+        history_id = str(data['historyId']) # Ensure historyId is a string
         doc_ref = db.collection('processed_history').document(history_id)
         
         @firestore.transactional
         def check_and_set_history(transaction, doc_ref):
             snapshot = doc_ref.get(transaction=transaction)
             if snapshot.exists:
-                return True
+                return True # Indicates duplicate
             else:
                 transaction.set(doc_ref, {'timestamp': firestore.SERVER_TIMESTAMP})
-                return False
+                return False # Indicates not a duplicate
 
         transaction = db.transaction()
         is_duplicate = check_and_set_history(transaction, doc_ref)
@@ -313,17 +315,17 @@ def process_email_request():
         
         msg_id = list_response['messages'][0]['id']
         
+        # --- FIX: Mark as read immediately to avoid race conditions ---
+        gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
+        
         message = gmail_service.users().messages().get(userId='me', id=msg_id, format='full').execute()
         
         headers = message['payload']['headers']
         is_agent_sent = any(h['name'] == 'X-Agent-Processed' and h['value'] == 'true' for h in headers)
         if is_agent_sent:
             print(f"Ignoring agent's own message: {msg_id}")
-            gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
             return "Agent message ignored.", 200
 
-        gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
-        
         subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
         full_email_text = get_full_email_text(message['payload'])
         
@@ -340,6 +342,8 @@ def process_email_request():
              return "Owner not in thread, request ignored.", 200
 
         hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', full_email_text)
+
+        # --- FIX: Improved logic to handle replies ---
         is_reply_to_agent = "AI assistant" in full_email_text and hidden_data_matches and owner_email not in original_from_header
 
         if is_reply_to_agent:
@@ -372,6 +376,7 @@ def process_email_request():
                 start_time_et = ET.localize(datetime.fromisoformat(event_data['start']))
                 duration = event_data['duration']
                 
+                # --- FIX: Correct participant parsing ---
                 all_emails_str = original_to + "," + original_cc + "," + original_from_header
                 attendees = list(set(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', all_emails_str)))
                 if owner_email not in attendees:
@@ -447,4 +452,3 @@ def process_email_request():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(debug=True, host='0.0.0.0', port=port)
-
