@@ -102,6 +102,7 @@ def get_conversation_intent_with_ai(email_thread_text, current_date_et, api_key)
 
 def find_available_slots(service, calendar_id, preferences):
     """Finds available slots based on AI-parsed preferences, skipping weekends."""
+    # --- FIX: Handle case where AI returns null for duration ---
     duration_minutes = preferences.get('duration') or 60
     day_preference = preferences.get('day_preference')
     time_of_day = preferences.get('time_of_day')
