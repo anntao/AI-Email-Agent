@@ -350,51 +350,56 @@ def process_email_request():
             for hidden_info_str in hidden_data_matches:
                 slot_data = json.loads(hidden_info_str)
                 start_time_et = ET.localize(datetime.fromisoformat(slot_data['start']))
-                possible_slots_text += f"- {start_time_et.strftime('%A, %B %d at %I:%M %p ET')} for {slot_data['duration']} minutes.\n"
+                possible_slots_text += f"- {start_time_et.strftime('%A, %B %d at %I:%M %p ET')} ({slot_data['start']})\n"
             
             gemini_api_key = os.environ.get("GEMINI_API_KEY")
             genai.configure(api_key=gemini_api_key)
             model = genai.GenerativeModel('gemini-1.5-flash-latest')
             prompt = f"""
-            Read the user's reply and determine if they confirmed one of the proposed meeting times.
+            Analyze the user's reply to determine if they confirmed one of the proposed meeting times.
             The original options were:
             {possible_slots_text}
             The user's reply is: "{full_email_text}"
             
             Respond with a JSON object containing one key: "confirmed_start_time_iso".
-            The value should be the ISO 8601 formatted string of the chosen time slot (e.g., "2025-07-25T09:30:00-04:00").
-            If the user did not clearly confirm one of the options, the value should be null.
+            The value should be the exact ISO 8601 formatted string of the chosen time slot from the options provided (e.g., "2025-07-25T09:30:00-04:00").
+            If the user did not clearly confirm one of the specific options, the value MUST be null.
             JSON:
             """
             response = model.generate_content(prompt)
+            print(f"AI response for confirmation: {response.text}")
             json_str = response.text.strip().replace('```json', '').replace('```', '').strip()
             choice_data = json.loads(json_str)
             confirmed_start_time_iso = choice_data.get('confirmed_start_time_iso')
 
             if confirmed_start_time_iso:
-                start_time_et = ET.localize(datetime.fromisoformat(confirmed_start_time_iso))
-                
-                # Find the duration from the original hidden data
+                # Find the duration from the original hidden data by matching the confirmed ISO string
                 duration = 60 # default
+                found_match = False
                 for hidden_info_str in hidden_data_matches:
                     event_data = json.loads(hidden_info_str)
                     if event_data['start'] == confirmed_start_time_iso:
                         duration = event_data['duration']
+                        found_match = True
                         break
+                
+                if found_match:
+                    start_time_et = ET.localize(datetime.fromisoformat(confirmed_start_time_iso))
+                    all_emails_str = original_to + "," + original_cc + "," + original_from_header
+                    attendees = list(set(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', all_emails_str)))
+                    if owner_email not in attendees:
+                        attendees.append(owner_email)
+                    attendees = [email for email in attendees if email != agent_email]
 
-                all_emails_str = original_to + "," + original_cc + "," + original_from_header
-                attendees = list(set(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', all_emails_str)))
-                if owner_email not in attendees:
-                    attendees.append(owner_email)
-                attendees = [email for email in attendees if email != agent_email]
-
-                create_calendar_event(calendar_service, owner_email, f"Meeting: {subject.replace('Re: ', '')}", start_time_et, duration, attendees)
-                print(f"Event scheduled with {', '.join(attendees)}")
+                    create_calendar_event(calendar_service, owner_email, f"Meeting: {subject.replace('Re: ', '')}", start_time_et, duration, attendees)
+                    print(f"Event scheduled with {', '.join(attendees)}")
+                else:
+                    print(f"AI returned a time ({confirmed_start_time_iso}) that was not in the original options. Re-suggesting.")
             else:
-                 print("Could not determine user's choice from reply. Will fall through and re-suggest.")
+                 print("Could not determine user's choice from reply. Re-suggesting.")
         
-        # This logic now correctly runs only for initial requests OR if the reply was unclear
-        if not (hidden_data_matches and owner_email not in original_from_header):
+        # This logic now correctly runs only for initial requests OR if the reply was unclear or mismatched
+        if not (hidden_data_matches and owner_email not in original_from_header and confirmed_start_time_iso):
             print("Detected initial request or unclear reply. Finding slots.")
             preferences = get_email_intent_with_ai(full_email_text, datetime.now(ET), gemini_api_key)
             available_slots = find_available_slots(calendar_service, owner_email, preferences)
