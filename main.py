@@ -29,9 +29,6 @@ ET = pytz.timezone('America/New_York')
 WORK_START_HOUR_ET = 9.5  # 9:30 AM
 WORK_END_HOUR_ET = 18.0   # 6:00 PM
 
-# --- Firestore Client Initialization ---
-db = firestore.Client()
-
 # --- Helper function to get secrets ---
 def get_secret(project_id, secret_id, version_id="latest"):
     """Access the Secret Manager API to retrieve a secret."""
@@ -264,23 +261,37 @@ def process_email_request():
         print("ERROR: Could not automatically determine project ID.")
         return "Internal Server Error", 500
 
+    # FIX: Initialize Firestore client inside the request handler
+    db = firestore.Client(project=project_id)
     gemini_api_key = os.environ.get("GEMINI_API_KEY")
     
     # --- FIX: Use Firestore for robust deduplication ---
     try:
         data = json.loads(base64.b64decode(envelope['message']['data']).decode('utf-8'))
-        history = db.collection('processed_messages').document(data['emailAddress']).collection('history').document(str(data['historyId'])).get()
-        if history.exists:
-            print(f"Duplicate historyId detected: {data['historyId']}. Ignoring.")
-            return "Duplicate message", 200
+        history_id = str(data['historyId']) # Ensure historyId is a string
+        doc_ref = db.collection('processed_history').document(history_id)
         
-        # Create a document to lock this history ID
-        db.collection('processed_messages').document(data['emailAddress']).collection('history').document(str(data['historyId'])).set({
-            'timestamp': firestore.SERVER_TIMESTAMP
-        })
+        @firestore.transactional
+        def check_and_set_history(transaction, doc_ref):
+            snapshot = doc_ref.get(transaction=transaction)
+            if snapshot.exists:
+                # This history ID has been seen.
+                return True # Indicates duplicate
+            else:
+                # This is a new history ID.
+                transaction.set(doc_ref, {'timestamp': firestore.SERVER_TIMESTAMP})
+                return False # Indicates not a duplicate
+
+        transaction = db.transaction()
+        is_duplicate = check_and_set_history(transaction, doc_ref)
+
+        if is_duplicate:
+            print(f"Duplicate historyId detected: {history_id}. Ignoring.")
+            return "Duplicate message", 200
+
     except Exception as e:
         print(f"Firestore deduplication check failed: {e}")
-        # Continue cautiously, but log the error
+        return "Internal Server Error", 500
     
     sleep_timer.sleep(5)
     
