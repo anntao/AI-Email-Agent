@@ -6,3 +6,4 @@ google-generativeai
 Flask
 gunicorn
 google-cloud-secret-manager
+google-cloud-firestore
