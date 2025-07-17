@@ -131,8 +131,10 @@ def find_available_slots(service, calendar_id, preferences):
     search_start_date_et = now_et
     if start_date_str:
         try:
-            search_start_date_et = ET.localize(datetime.strptime(start_date_str, '%Y-%m-%d'))
-        except ValueError:
+            # Localize the date provided by the AI
+            parsed_date = datetime.strptime(start_date_str, '%Y-%m-%d')
+            search_start_date_et = ET.localize(parsed_date)
+        except (ValueError, TypeError):
             print(f"AI provided an invalid start_date format: {start_date_str}. Using today.")
 
     time_min_utc = search_start_date_et.astimezone(pytz.utc).isoformat()
@@ -154,14 +156,17 @@ def find_available_slots(service, calendar_id, preferences):
     }
     target_weekday = weekday_map.get(day_preference.lower()) if day_preference else None
     
-    # Start checking from day 0 (today or the specified start date)
-    for day_offset in range(14):
+    for day_offset in range(14): # Search up to 14 days from the start date
         if len(available_slots) >= 3:
             break
             
-        day_to_check = (search_start_date_et + timedelta(days=day_offset))
+        day_to_check = (search_start_date_et + timedelta(days=day_offset)).date()
         
-        if day_to_check.date() < now_et.date():
+        # Don't suggest slots for today if it's already past working hours
+        if day_to_check == now_et.date() and now_et.time() > time(int(WORK_END_HOUR_ET), int((WORK_END_HOUR_ET*60)%60)) :
+            continue
+        
+        if day_to_check < now_et.date():
             continue
 
         if day_to_check.weekday() >= 5: 
@@ -170,16 +175,16 @@ def find_available_slots(service, calendar_id, preferences):
         if target_weekday is not None and day_to_check.weekday() != target_weekday:
             continue
 
-        workday_start_et = ET.localize(datetime.combine(day_to_check.date(), time())) + timedelta(hours=WORK_START_HOUR_ET)
-        workday_end_et = ET.localize(datetime.combine(day_to_check.date(), time())) + timedelta(hours=WORK_END_HOUR_ET)
+        workday_start_et = ET.localize(datetime.combine(day_to_check, time(int(WORK_START_HOUR_ET), int((WORK_START_HOUR_ET*60)%60))))
+        workday_end_et = ET.localize(datetime.combine(day_to_check, time(int(WORK_END_HOUR_ET), int((WORK_END_HOUR_ET*60)%60))))
         
         if time_of_day == "morning":
-            workday_end_et = min(workday_end_et, ET.localize(datetime.combine(day_to_check.date(), morning_end)))
+            workday_end_et = min(workday_end_et, ET.localize(datetime.combine(day_to_check, morning_end)))
         elif time_of_day == "afternoon":
-            workday_start_et = max(workday_start_et, ET.localize(datetime.combine(day_to_check.date(), afternoon_start)))
+            workday_start_et = max(workday_start_et, ET.localize(datetime.combine(day_to_check, afternoon_start)))
 
         # Ensure we don't suggest slots in the past
-        current_slot_start_et = max(workday_start_et, now_et)
+        current_slot_start_et = max(workday_start_et, now_et + timedelta(minutes=5)) # Add 5 min buffer
         
         while current_slot_start_et + timedelta(minutes=duration_minutes) <= workday_end_et:
             slot_start_et = current_slot_start_et
@@ -199,10 +204,10 @@ def find_available_slots(service, calendar_id, preferences):
                     is_available = False
                     break
             
-            if is_available and day_to_check.date() not in found_days:
+            if is_available and day_to_check not in found_days:
                 available_slots.append({'slot': slot_start_et, 'duration': duration_minutes})
-                found_days.add(day_to_check.date())
-                if not day_preference and len(found_days) >= 3:
+                found_days.add(day_to_check)
+                if not day_preference and not start_date_str and len(found_days) >= 3:
                     break
             
             current_slot_start_et += timedelta(minutes=30)
@@ -367,8 +372,8 @@ def process_email_request():
                     hidden_info = json.dumps({'start': slot_et.isoformat(), 'duration': slot_data['duration']})
                     hidden_data_for_body += f"<!-- data: {hidden_info} -->\n"
                 
-                sender_name = re.match(r'"?(.*?)"?\s*<', original_from_header)
-                recipient_name = sender_name.group(1) if sender_name else "there"
+                sender_name_match = re.search(r'"?([^<"]+)"?\s*<', original_from_header)
+                recipient_name = sender_name_match.group(1).strip() if sender_name_match else "there"
 
                 genai.configure(api_key=GEMINI_API_KEY)
                 model = genai.GenerativeModel('gemini-1.5-flash-latest')
@@ -398,6 +403,13 @@ def process_email_request():
                 all_emails = set(re.findall(r'<([^>]+)>', original_to + original_cc))
                 all_emails.update(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', original_to + original_cc))
                 participants = [email for email in all_emails if email not in [agent_email, owner_email]]
+                # Make sure the original sender is in the `to` field
+                original_sender_email_match = re.search(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', original_from_header)
+                if original_sender_email_match:
+                    original_sender_email = original_sender_email_match.group(0)
+                    if original_sender_email not in participants:
+                        participants.append(original_sender_email)
+
                 to_field = ", ".join(participants)
                 cc_field = owner_email
                 
