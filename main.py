@@ -14,11 +14,10 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from google.cloud import secretmanager
-from google.cloud import firestore  # Import Firestore
-from google.api_core import exceptions as google_exceptions
+from google.cloud import firestore
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-import time as sleep_timer 
+import time as sleep_timer
 
 # --- Flask App Initialization ---
 app = Flask(__name__)
@@ -275,10 +274,8 @@ def process_email_request():
         def check_and_set_history(transaction, doc_ref):
             snapshot = doc_ref.get(transaction=transaction)
             if snapshot.exists:
-                # This history ID has been seen.
                 return True # Indicates duplicate
             else:
-                # This is a new history ID.
                 transaction.set(doc_ref, {'timestamp': firestore.SERVER_TIMESTAMP})
                 return False # Indicates not a duplicate
 
@@ -320,7 +317,7 @@ def process_email_request():
         msg_id = list_response['messages'][0]['id']
         message = gmail_service.users().messages().get(userId='me', id=msg_id, format='full').execute()
         
-        # Mark as read *after* getting the full message to avoid race conditions
+        # Mark as read immediately to avoid race conditions
         gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
         
         headers = message['payload']['headers']
