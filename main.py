@@ -14,10 +14,11 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from google.cloud import secretmanager
+from google.cloud import firestore  # Import Firestore
+from google.api_core import exceptions as google_exceptions
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-import time as sleep_timer # Renamed to avoid conflict with time object
-from collections import deque
+import time as sleep_timer 
 
 # --- Flask App Initialization ---
 app = Flask(__name__)
@@ -28,8 +29,8 @@ ET = pytz.timezone('America/New_York')
 WORK_START_HOUR_ET = 9.5  # 9:30 AM
 WORK_END_HOUR_ET = 18.0   # 6:00 PM
 
-# --- In-memory cache for deduplication ---
-PROCESSED_MESSAGE_IDS = deque(maxlen=100) # Store the last 100 message IDs
+# --- Firestore Client Initialization ---
+db = firestore.Client()
 
 # --- Helper function to get secrets ---
 def get_secret(project_id, secret_id, version_id="latest"):
@@ -43,26 +44,14 @@ def get_secret(project_id, secret_id, version_id="latest"):
         print(f"ERROR: Could not access secret: {secret_id}. Error: {e}")
         return None
 
-# --- Get Project ID and Secrets ---
-try:
-    _, PROJECT_ID = google.auth.default()
-    print(f"Successfully determined Project ID: {PROJECT_ID}")
-except google.auth.exceptions.DefaultCredentialsError:
-    print("Could not automatically determine project ID. Is this running locally?")
-    PROJECT_ID = None
-
-# This now correctly reads the secret you exposed as an environment variable in Cloud Run
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-
-
-def authenticate_with_secrets():
+def authenticate_with_secrets(project_id):
     """Authenticates with Google APIs using credentials from Secret Manager."""
     creds = None
-    if not PROJECT_ID:
-        print("ERROR: GCP_PROJECT environment variable not set. Running locally?")
+    if not project_id:
+        print("ERROR: GCP_PROJECT could not be determined.")
         return None
 
-    token_json_str = get_secret(PROJECT_ID, "agent-token-json")
+    token_json_str = get_secret(project_id, "agent-token-json")
     
     if not token_json_str:
         print("ERROR: Could not retrieve token from Secret Manager.")
@@ -86,14 +75,14 @@ def authenticate_with_secrets():
             
     return creds
 
-def get_email_intent_with_ai(email_thread_text, current_date_et):
+def get_email_intent_with_ai(email_thread_text, current_date_et, api_key):
     """Uses Gemini to parse the user's intent from the full email thread."""
-    if not GEMINI_API_KEY:
+    if not api_key:
         print("WARN: Gemini API key is not configured. Using fallback.")
         return {'duration': 60, 'day_preference': None, 'time_of_day': None, 'start_date': None}
         
     try:
-        genai.configure(api_key=GEMINI_API_KEY)
+        genai.configure(api_key=api_key)
         model = genai.GenerativeModel('gemini-1.5-flash-latest')
         prompt = f"""
         Analyze the following email thread to determine scheduling preferences. The current date is {current_date_et.strftime('%Y-%m-%d')}.
@@ -268,21 +257,38 @@ def process_email_request():
         print('Invalid Pub/Sub message format. This may be a health check.')
         return 'OK', 200
     
+    # --- FIX: Moved environment discovery inside the request handler ---
+    try:
+        _, project_id = google.auth.default()
+    except google.auth.exceptions.DefaultCredentialsError:
+        print("ERROR: Could not automatically determine project ID.")
+        return "Internal Server Error", 500
+
+    gemini_api_key = os.environ.get("GEMINI_API_KEY")
+    
+    # --- FIX: Use Firestore for robust deduplication ---
     try:
         data = json.loads(base64.b64decode(envelope['message']['data']).decode('utf-8'))
-        history_id = data['historyId']
+        history = db.collection('processed_messages').document(data['emailAddress']).collection('history').document(str(data['historyId'])).get()
+        if history.exists:
+            print(f"Duplicate historyId detected: {data['historyId']}. Ignoring.")
+            return "Duplicate message", 200
+        
+        # Create a document to lock this history ID
+        db.collection('processed_messages').document(data['emailAddress']).collection('history').document(str(data['historyId'])).set({
+            'timestamp': firestore.SERVER_TIMESTAMP
+        })
     except Exception as e:
-        print(f"Could not decode Pub/Sub message: {e}")
-        return "Bad Request", 400
-
-    # Wait for API to sync
+        print(f"Firestore deduplication check failed: {e}")
+        # Continue cautiously, but log the error
+    
     sleep_timer.sleep(5)
     
     agent_email = 'anntaoai@gmail.com'
     owner_email = 'anntaod@gmail.com'
     owner_name = 'Anntao'
 
-    creds = authenticate_with_secrets()
+    creds = authenticate_with_secrets(project_id)
     if not creds:
         return "Authentication failed.", 500
 
@@ -294,31 +300,17 @@ def process_email_request():
         return "Service build failed.", 500
 
     try:
-        # --- FIX: Deduplication using Message ID ---
-        history = gmail_service.users().history().list(userId='me', startHistoryId=history_id).execute()
+        # Get the specific message that triggered the event
+        list_response = gmail_service.users().messages().list(userId='me', q='is:unread', maxResults=1).execute()
+        if not list_response.get('messages'):
+            print("No new unread messages found.")
+            return "No unread messages.", 200
         
-        messages_added = []
-        if 'history' in history:
-            for h in history['history']:
-                messages_added.extend(h.get('messagesAdded', []))
-
-        if not messages_added:
-            print("No message was added in this history event.")
-            return "No message added.", 200
-
-        msg_id = messages_added[0]['message']['id']
-        
-        # Check for duplicates
-        if msg_id in PROCESSED_MESSAGE_IDS:
-            print(f"Duplicate message ID detected: {msg_id}. Ignoring.")
-            return "Duplicate message", 200
-        PROCESSED_MESSAGE_IDS.append(msg_id)
-        print(f"Stored new message ID: {msg_id}")
-
-        # Mark as read to be safe
-        gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
-        
+        msg_id = list_response['messages'][0]['id']
         message = gmail_service.users().messages().get(userId='me', id=msg_id, format='full').execute()
+        
+        # Mark as read *after* getting the full message to avoid race conditions
+        gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
         
         headers = message['payload']['headers']
         subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
@@ -339,7 +331,6 @@ def process_email_request():
 
         hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', full_email_text)
 
-        # --- FIX: Logic to handle replies ---
         is_reply_to_agent = "AI assistant" in full_email_text and hidden_data_matches and owner_email not in original_from_header
 
         if is_reply_to_agent:
@@ -350,7 +341,7 @@ def process_email_request():
                 start_time_et = ET.localize(datetime.fromisoformat(slot_data['start']))
                 possible_slots_text += f"Option {i+1}: {start_time_et.strftime('%A, %B %d at %I:%M %p ET')} for {slot_data['duration']} minutes.\n"
             
-            genai.configure(api_key=GEMINI_API_KEY)
+            genai.configure(api_key=gemini_api_key)
             model = genai.GenerativeModel('gemini-1.5-flash-latest')
             prompt = f"""
             Read the user's reply to determine which option they chose for the meeting.
@@ -381,9 +372,9 @@ def process_email_request():
                 create_calendar_event(calendar_service, owner_email, f"Meeting: {subject.replace('Re: ', '')}", start_time_et, duration, attendees)
                 print(f"Event scheduled with {', '.join(attendees)}")
         
-        else: # This is an initial request
+        else:
             print("Detected initial request. Finding slots.")
-            preferences = get_email_intent_with_ai(full_email_text, datetime.now(ET))
+            preferences = get_email_intent_with_ai(full_email_text, datetime.now(ET), gemini_api_key)
             available_slots = find_available_slots(calendar_service, owner_email, preferences)
             
             if available_slots:
@@ -398,7 +389,7 @@ def process_email_request():
                 sender_name_match = re.search(r'"?([^<"]+)"?\s*<', original_from_header)
                 recipient_name = sender_name_match.group(1).strip() if sender_name_match else "there"
 
-                genai.configure(api_key=GEMINI_API_KEY)
+                genai.configure(api_key=gemini_api_key)
                 model = genai.GenerativeModel('gemini-1.5-flash-latest')
                 prompt = f"""
                 You are a helpful AI assistant for {owner_name}.
@@ -448,3 +439,5 @@ def process_email_request():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(debug=True, host='0.0.0.0', port=port)
+```
+
