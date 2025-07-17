@@ -243,15 +243,30 @@ def get_full_email_body(payload):
     This is necessary to find the hidden data comments in replies.
     """
     body = ""
+    
+    # Handle multipart messages
     if 'parts' in payload:
         for part in payload['parts']:
             body += get_full_email_body(part)
+    
+    # Handle single part messages
     elif payload.get('body') and payload['body'].get('data'):
         data = payload['body']['data']
         try:
-            body += base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')
+            decoded = base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')
+            body += decoded
+            print(f"Decoded email part: {len(decoded)} chars")
         except Exception as e:
             print(f"Could not decode email part: {e}")
+    
+    # Handle messages with body but no data (sometimes happens)
+    elif payload.get('body') and payload['body'].get('data') is None:
+        print("Email part has body but no data field")
+    
+    # Debug: print payload structure for troubleshooting
+    if not body and 'mimeType' in payload:
+        print(f"Email part MIME type: {payload['mimeType']}")
+    
     return body
 
 @app.route('/', methods=['POST'])
@@ -335,6 +350,8 @@ def process_email_request():
         subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
         
         full_email_text = get_full_email_body(message['payload'])
+        print(f"Extracted email text length: {len(full_email_text)}")
+        print(f"Email text preview (first 500 chars): {full_email_text[:500]}")
         
         message_id_header = next((h['value'] for h in headers if h['name'].lower() == 'message-id'), None)
         references_header = next((h['value'] for h in headers if h['name'].lower() == 'references'), '')
@@ -360,6 +377,17 @@ def process_email_request():
                 print(f"AI returned confirmed time: {confirmed_start_time_iso}")
                 hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', full_email_text)
                 print(f"Found {len(hidden_data_matches)} hidden data matches in email")
+                
+                # Debug: search for any HTML comments
+                all_comments = re.findall(r'<!--.*?-->', full_email_text)
+                print(f"Total HTML comments found: {len(all_comments)}")
+                for i, comment in enumerate(all_comments[:3]):  # Show first 3 comments
+                    print(f"Comment {i+1}: {comment}")
+                
+                # Debug: search for "data:" anywhere in the text
+                data_occurrences = full_email_text.count('data:')
+                print(f"Occurrences of 'data:' in email: {data_occurrences}")
+                
                 duration = 60 
                 found_match = False
                 
