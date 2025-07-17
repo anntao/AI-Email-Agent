@@ -58,7 +58,6 @@ def authenticate_with_secrets():
         print("ERROR: GCP_PROJECT environment variable not set. Running locally?")
         return None
 
-    # Fetch the contents of the token file from Secret Manager
     token_json_str = get_secret(PROJECT_ID, "agent-token-json")
     
     if not token_json_str:
@@ -66,14 +65,12 @@ def authenticate_with_secrets():
         return None
 
     try:
-        # Load the credentials directly from the secret's string content
         creds_info = json.loads(token_json_str)
         creds = Credentials.from_authorized_user_info(creds_info, SCOPES)
     except Exception as e:
         print(f"ERROR: Could not load credentials from secret data. Error: {e}")
         return None
 
-    # Check if the token is valid or needs to be refreshed
     if creds and creds.expired and creds.refresh_token:
         try:
             print("Token expired, attempting to refresh...")
@@ -127,11 +124,9 @@ def find_available_slots(service, calendar_id, preferences):
     now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
     now_et = now_utc.astimezone(ET)
     
-    # --- NEW: Use AI-provided start date if available ---
     search_start_date_et = now_et
     if start_date_str:
         try:
-            # Localize the date provided by the AI
             parsed_date = datetime.strptime(start_date_str, '%Y-%m-%d')
             search_start_date_et = ET.localize(parsed_date)
         except (ValueError, TypeError):
@@ -156,43 +151,35 @@ def find_available_slots(service, calendar_id, preferences):
     }
     target_weekday = weekday_map.get(day_preference.lower()) if day_preference else None
     
-    for day_offset in range(14): # Search up to 14 days from the start date
+    for day_offset in range(14):
         if len(available_slots) >= 3:
             break
             
-        day_to_check = (search_start_date_et + timedelta(days=day_offset)).date()
+        day_to_check_naive = (search_start_date_et + timedelta(days=day_offset)).date()
         
-        # Don't suggest slots for today if it's already past working hours
-        if day_to_check == now_et.date() and now_et.time() > time(int(WORK_END_HOUR_ET), int((WORK_END_HOUR_ET*60)%60)) :
-            continue
-        
-        if day_to_check < now_et.date():
+        if day_to_check_naive < now_et.date():
             continue
 
-        if day_to_check.weekday() >= 5: 
+        if day_to_check_naive.weekday() >= 5: 
             continue
             
-        if target_weekday is not None and day_to_check.weekday() != target_weekday:
+        if target_weekday is not None and day_to_check_naive.weekday() != target_weekday:
             continue
 
-        workday_start_et = ET.localize(datetime.combine(day_to_check, time(int(WORK_START_HOUR_ET), int((WORK_START_HOUR_ET*60)%60))))
-        workday_end_et = ET.localize(datetime.combine(day_to_check, time(int(WORK_END_HOUR_ET), int((WORK_END_HOUR_ET*60)%60))))
+        workday_start_et = ET.localize(datetime.combine(day_to_check_naive, time(int(WORK_START_HOUR_ET), int((WORK_START_HOUR_ET*60)%60))))
+        workday_end_et = ET.localize(datetime.combine(day_to_check_naive, time(int(WORK_END_HOUR_ET), int((WORK_END_HOUR_ET*60)%60))))
         
         if time_of_day == "morning":
-            workday_end_et = min(workday_end_et, ET.localize(datetime.combine(day_to_check, morning_end)))
+            workday_end_et = min(workday_end_et, ET.localize(datetime.combine(day_to_check_naive, morning_end)))
         elif time_of_day == "afternoon":
-            workday_start_et = max(workday_start_et, ET.localize(datetime.combine(day_to_check, afternoon_start)))
+            workday_start_et = max(workday_start_et, ET.localize(datetime.combine(day_to_check_naive, afternoon_start)))
 
-        # Ensure we don't suggest slots in the past
-        current_slot_start_et = max(workday_start_et, now_et + timedelta(minutes=5)) # Add 5 min buffer
+        current_slot_start_et = max(workday_start_et, now_et + timedelta(minutes=5))
         
         while current_slot_start_et + timedelta(minutes=duration_minutes) <= workday_end_et:
             slot_start_et = current_slot_start_et
             slot_end_et = slot_start_et + timedelta(minutes=duration_minutes)
             
-            slot_start_utc = slot_start_et.astimezone(pytz.utc)
-            slot_end_utc = slot_end_et.astimezone(pytz.utc)
-
             is_available = True
             for event in busy_slots:
                 event_start_str = event['start'].get('dateTime', event['start'].get('date'))
@@ -200,13 +187,13 @@ def find_available_slots(service, calendar_id, preferences):
                 if 'T' not in event_start_str: continue 
                 event_start_utc = datetime.fromisoformat(event_start_str.replace('Z', '+00:00'))
                 event_end_utc = datetime.fromisoformat(event_end_str.replace('Z', '+00:00'))
-                if max(slot_start_utc, event_start_utc) < min(slot_end_utc, event_end_utc):
+                if max(slot_start_et.astimezone(pytz.utc), event_start_utc) < min(slot_end_et.astimezone(pytz.utc), event_end_utc):
                     is_available = False
                     break
             
-            if is_available and day_to_check not in found_days:
+            if is_available and day_to_check_naive not in found_days:
                 available_slots.append({'slot': slot_start_et, 'duration': duration_minutes})
-                found_days.add(day_to_check)
+                found_days.add(day_to_check_naive)
                 if not day_preference and not start_date_str and len(found_days) >= 3:
                     break
             
@@ -246,6 +233,7 @@ def create_calendar_event(service, calendar_id, summary, start_time_et, duration
         'start': {'dateTime': start_utc.isoformat(), 'timeZone': 'America/New_York'},
         'end': {'dateTime': end_utc.isoformat(), 'timeZone': 'America/New_York'},
         'attendees': [{'email': email} for email in attendees],
+        'reminders': {'useDefault': True},
     }
     created_event = service.events().insert(calendarId=calendar_id, body=event, sendNotifications=True).execute()
     print(f'Event created: {created_event.get("htmlLink")}')
@@ -293,7 +281,6 @@ def process_email_request():
         return "Service build failed.", 500
 
     try:
-        # --- FIX: Mark as read immediately to prevent double processing ---
         list_response = gmail_service.users().messages().list(userId='me', q='is:unread', maxResults=1).execute()
         if not list_response.get('messages'):
             print("No new unread messages found.")
@@ -324,7 +311,11 @@ def process_email_request():
 
         hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', full_email_text)
 
-        if hidden_data_matches:
+        # --- FIX: Logic to handle replies ---
+        is_reply_to_agent = "AI assistant" in full_email_text and hidden_data_matches
+
+        if is_reply_to_agent:
+            print("Detected reply to agent. Attempting to schedule event.")
             possible_slots_text = ""
             for i, hidden_info_str in enumerate(hidden_data_matches):
                 slot_data = json.loads(hidden_info_str)
@@ -353,13 +344,18 @@ def process_email_request():
                 start_time_et = ET.localize(datetime.fromisoformat(event_data['start']))
                 duration = event_data['duration']
                 
-                participants = [email.strip() for email in re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', original_from_header)]
-                attendees = [owner_email] + participants
+                # Correctly identify all participants for the final invite
+                all_emails = set(re.findall(r'<([^>]+)>', original_to + original_cc + original_from_header))
+                all_emails.update(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', original_to + original_cc + original_from_header))
+                attendees = [email for email in all_emails if email != agent_email]
+                if owner_email not in attendees:
+                    attendees.append(owner_email)
 
-                create_calendar_event(calendar_service, owner_email, f"Meeting with {owner_name}", start_time_et, duration, attendees)
-                print(f"Event scheduled with {', '.join(participants)}")
+                create_calendar_event(calendar_service, owner_email, f"Meeting: {subject.replace('Re: ', '')}", start_time_et, duration, attendees)
+                print(f"Event scheduled with {', '.join(attendees)}")
         
-        else:
+        else: # This is an initial request
+            print("Detected initial request. Finding slots.")
             preferences = get_email_intent_with_ai(full_email_text, datetime.now(ET))
             available_slots = find_available_slots(calendar_service, owner_email, preferences)
             
@@ -400,17 +396,13 @@ def process_email_request():
 
                 clean_subject = f"Re: {subject.replace('Re: ', '')}"
                 
-                all_emails = set(re.findall(r'<([^>]+)>', original_to + original_cc))
-                all_emails.update(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', original_to + original_cc))
-                participants = [email for email in all_emails if email not in [agent_email, owner_email]]
-                # Make sure the original sender is in the `to` field
-                original_sender_email_match = re.search(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', original_from_header)
-                if original_sender_email_match:
-                    original_sender_email = original_sender_email_match.group(0)
-                    if original_sender_email not in participants:
-                        participants.append(original_sender_email)
+                all_emails = set(re.findall(r'<([^>]+)>', original_to + original_cc + original_from_header))
+                all_emails.update(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', original_to + original_cc + original_from_header))
+                participants = [email for email in all_emails if email != agent_email]
+                if owner_email not in participants:
+                     participants.append(owner_email)
 
-                to_field = ", ".join(participants)
+                to_field = ", ".join(p for p in participants if p != owner_email)
                 cc_field = owner_email
                 
                 email_message = create_threaded_email(agent_email, to_field, cc_field, clean_subject, html_body, in_reply_to=message_id_header, references=new_references)
