@@ -351,12 +351,15 @@ def process_email_request():
                 found_match = False
                 
                 # --- FIX: Normalize datetimes by rounding to the minute before comparing ---
-                confirmed_dt_rounded = datetime.fromisoformat(confirmed_start_time_iso).replace(second=0, microsecond=0)
+                confirmed_dt_rounded = datetime.fromisoformat(confirmed_start_time_iso).astimezone(ET).replace(second=0, microsecond=0)
 
                 for hidden_info_str in hidden_data_matches:
                     event_data = json.loads(hidden_info_str)
-                    event_dt_rounded = datetime.fromisoformat(event_data['start']).replace(second=0, microsecond=0)
+                    event_dt_rounded = datetime.fromisoformat(event_data['start']).astimezone(ET).replace(second=0, microsecond=0)
                     
+                    # --- FIX: Add debug print statement ---
+                    print(f"Comparing: AI='{confirmed_dt_rounded}' vs Option='{event_dt_rounded}'")
+
                     if event_dt_rounded == confirmed_dt_rounded:
                         duration = event_data['duration']
                         found_match = True
