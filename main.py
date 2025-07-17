@@ -44,8 +44,8 @@ except google.auth.exceptions.DefaultCredentialsError:
     print("Could not automatically determine project ID. Is this running locally?")
     PROJECT_ID = None
 
-# You should store your Gemini API Key as a secret named 'GEMINI_API_KEY'
-GEMINI_API_KEY = get_secret(PROJECT_ID, "GEMINI_API_KEY") if PROJECT_ID else os.environ.get('GEMINI_API_KEY_LOCAL')
+# This now correctly reads the secret you exposed as an environment variable in Cloud Run
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 
 def authenticate_with_secrets():
