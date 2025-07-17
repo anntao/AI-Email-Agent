@@ -78,8 +78,6 @@ def authenticate_with_secrets():
         try:
             print("Token expired, attempting to refresh...")
             creds.refresh(Request())
-            # Note: A mechanism would be needed here to update the secret with the new token
-            # if the refresh token is long-lived. For now, we proceed with the refreshed token.
             print("Token refreshed successfully for this session.")
         except Exception as e:
             print(f"ERROR: Could not refresh token. A new token may need to be generated manually. Error: {e}")
@@ -87,24 +85,25 @@ def authenticate_with_secrets():
             
     return creds
 
-def get_email_intent_with_ai(email_thread_text):
+def get_email_intent_with_ai(email_thread_text, current_date_et):
     """Uses Gemini to parse the user's intent from the full email thread."""
     if not GEMINI_API_KEY:
-        print("WARN: Gemini API key is not configured. Using fallback (60 min default).")
-        return {'duration': 60, 'day_preference': None, 'time_of_day': None}
+        print("WARN: Gemini API key is not configured. Using fallback.")
+        return {'duration': 60, 'day_preference': None, 'time_of_day': None, 'start_date': None}
         
     try:
         genai.configure(api_key=GEMINI_API_KEY)
         model = genai.GenerativeModel('gemini-1.5-flash-latest')
         prompt = f"""
-        Analyze the following email thread to determine scheduling preferences.
+        Analyze the following email thread to determine scheduling preferences. The current date is {current_date_et.strftime('%Y-%m-%d')}.
         Your goal is to be a helpful assistant.
 
         1.  **Duration**: Find the meeting duration in minutes (e.g., 30 or 60). Default to 60.
         2.  **Day Preference**: Identify a specific day of the week if mentioned (e.g., "Monday", "Friday").
         3.  **Time of Day**: Identify a time preference ("morning", "afternoon").
+        4.  **Start Date**: If the user mentions a relative date (e.g., "next week", "end of the week", "tomorrow"), calculate the target start date in 'YYYY-MM-DD' format. If no relative date is mentioned, this should be null.
 
-        Return a JSON object with keys: "duration", "day_preference", "time_of_day".
+        Return a JSON object with keys: "duration", "day_preference", "time_of_day", and "start_date".
         If a value isn't specified, use null.
 
         Email Thread: "{email_thread_text}"
@@ -112,24 +111,32 @@ def get_email_intent_with_ai(email_thread_text):
         JSON:
         """
         response = model.generate_content(prompt)
-        # Clean up the response to get a valid JSON string
         json_str = response.text.strip().replace('```json', '').replace('```', '').strip()
         return json.loads(json_str)
     except Exception as e:
         print(f"AI parsing failed: {e}. Using default values.")
-        return {'duration': 60, 'day_preference': None, 'time_of_day': None}
+        return {'duration': 60, 'day_preference': None, 'time_of_day': None, 'start_date': None}
 
 def find_available_slots(service, calendar_id, preferences):
     """Finds available slots based on AI-parsed preferences, skipping weekends."""
     duration_minutes = preferences.get('duration', 60)
     day_preference = preferences.get('day_preference')
     time_of_day = preferences.get('time_of_day')
+    start_date_str = preferences.get('start_date')
 
     now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
     now_et = now_utc.astimezone(ET)
     
-    time_min_utc = now_utc.isoformat()
-    time_max_utc = (now_utc + timedelta(days=14)).isoformat() # Look 14 days ahead
+    # --- NEW: Use AI-provided start date if available ---
+    search_start_date_et = now_et
+    if start_date_str:
+        try:
+            search_start_date_et = ET.localize(datetime.strptime(start_date_str, '%Y-%m-%d'))
+        except ValueError:
+            print(f"AI provided an invalid start_date format: {start_date_str}. Using today.")
+
+    time_min_utc = search_start_date_et.astimezone(pytz.utc).isoformat()
+    time_max_utc = (search_start_date_et.astimezone(pytz.utc) + timedelta(days=14)).isoformat()
 
     events_result = service.events().list(calendarId=calendar_id, timeMin=time_min_utc,
                                           timeMax=time_max_utc, singleEvents=True,
@@ -143,35 +150,36 @@ def find_available_slots(service, calendar_id, preferences):
     afternoon_start = time(12, 0)
     
     weekday_map = {
-        'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3,
-        'friday': 4
+        'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3, 'friday': 4
     }
     target_weekday = weekday_map.get(day_preference.lower()) if day_preference else None
-
-    for day_offset in range(1, 15):
+    
+    # Start checking from day 0 (today or the specified start date)
+    for day_offset in range(14):
         if len(available_slots) >= 3:
             break
             
-        day_to_check = (now_et + timedelta(days=day_offset))
+        day_to_check = (search_start_date_et + timedelta(days=day_offset))
         
-        # --- NEW: Skip weekends ---
-        if day_to_check.weekday() >= 5: # Monday is 0, Saturday is 5, Sunday is 6
+        if day_to_check.date() < now_et.date():
+            continue
+
+        if day_to_check.weekday() >= 5: 
             continue
             
-        # Skip if a specific day was requested and this isn't it
         if target_weekday is not None and day_to_check.weekday() != target_weekday:
             continue
 
         workday_start_et = ET.localize(datetime.combine(day_to_check.date(), time())) + timedelta(hours=WORK_START_HOUR_ET)
         workday_end_et = ET.localize(datetime.combine(day_to_check.date(), time())) + timedelta(hours=WORK_END_HOUR_ET)
         
-        # Adjust search window based on time_of_day preference
         if time_of_day == "morning":
             workday_end_et = min(workday_end_et, ET.localize(datetime.combine(day_to_check.date(), morning_end)))
         elif time_of_day == "afternoon":
             workday_start_et = max(workday_start_et, ET.localize(datetime.combine(day_to_check.date(), afternoon_start)))
 
-        current_slot_start_et = workday_start_et
+        # Ensure we don't suggest slots in the past
+        current_slot_start_et = max(workday_start_et, now_et)
         
         while current_slot_start_et + timedelta(minutes=duration_minutes) <= workday_end_et:
             slot_start_et = current_slot_start_et
@@ -184,10 +192,9 @@ def find_available_slots(service, calendar_id, preferences):
             for event in busy_slots:
                 event_start_str = event['start'].get('dateTime', event['start'].get('date'))
                 event_end_str = event['end'].get('dateTime', event['end'].get('date'))
-                if 'T' not in event_start_str: continue # Skip all-day events
+                if 'T' not in event_start_str: continue 
                 event_start_utc = datetime.fromisoformat(event_start_str.replace('Z', '+00:00'))
                 event_end_utc = datetime.fromisoformat(event_end_str.replace('Z', '+00:00'))
-                # Check for overlap
                 if max(slot_start_utc, event_start_utc) < min(slot_end_utc, event_end_utc):
                     is_available = False
                     break
@@ -243,16 +250,16 @@ def get_full_email_text(payload):
     body = ""
     if payload.get('body') and payload['body'].get('data'):
         data = payload['body']['data']
-        body += base64.urlsafe_b64decode(data).decode('utf-8')
+        body += base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')
     
     if 'parts' in payload:
         for part in payload['parts']:
             if part['mimeType'] == 'text/plain':
                 if part.get('body') and part['body'].get('data'):
                     data = part['body']['data']
-                    body += base64.urlsafe_b64decode(data).decode('utf-8')
+                    body += base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')
             elif 'parts' in part:
-                 body += get_full_email_text(part) # Recursive call
+                 body += get_full_email_text(part)
     return body
 
 @app.route('/', methods=['POST'])
@@ -281,18 +288,21 @@ def process_email_request():
         return "Service build failed.", 500
 
     try:
+        # --- FIX: Mark as read immediately to prevent double processing ---
         list_response = gmail_service.users().messages().list(userId='me', q='is:unread', maxResults=1).execute()
         if not list_response.get('messages'):
             print("No new unread messages found.")
             return "No unread messages.", 200
         
         msg_id = list_response['messages'][0]['id']
+        gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
+        print(f"Marked message {msg_id} as read to prevent reprocessing.")
+
         message = gmail_service.users().messages().get(userId='me', id=msg_id, format='full').execute()
         
         headers = message['payload']['headers']
         subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
         
-        # CORRECTLY get the full email text first
         full_email_text = get_full_email_text(message['payload'])
         
         message_id_header = next((h['value'] for h in headers if h['name'].lower() == 'message-id'), None)
@@ -305,14 +315,11 @@ def process_email_request():
         
         if owner_email not in (original_to + original_cc + original_from_header):
              print(f"Owner ({owner_email}) not in participants. Ignoring email.")
-             gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
              return "Owner not in thread, request ignored.", 200
 
-        # Check for our hidden data to see if this is a reply to the agent
         hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', full_email_text)
 
         if hidden_data_matches:
-            # This is a reply to the agent's suggestion
             possible_slots_text = ""
             for i, hidden_info_str in enumerate(hidden_data_matches):
                 slot_data = json.loads(hidden_info_str)
@@ -341,17 +348,14 @@ def process_email_request():
                 start_time_et = ET.localize(datetime.fromisoformat(event_data['start']))
                 duration = event_data['duration']
                 
-                # The person who replied is the one in the "From" header
                 participants = [email.strip() for email in re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', original_from_header)]
                 attendees = [owner_email] + participants
 
                 create_calendar_event(calendar_service, owner_email, f"Meeting with {owner_name}", start_time_et, duration, attendees)
-                gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
                 print(f"Event scheduled with {', '.join(participants)}")
         
         else:
-            # This is an initial request
-            preferences = get_email_intent_with_ai(full_email_text)
+            preferences = get_email_intent_with_ai(full_email_text, datetime.now(ET))
             available_slots = find_available_slots(calendar_service, owner_email, preferences)
             
             if available_slots:
@@ -363,7 +367,6 @@ def process_email_request():
                     hidden_info = json.dumps({'start': slot_et.isoformat(), 'duration': slot_data['duration']})
                     hidden_data_for_body += f"<!-- data: {hidden_info} -->\n"
                 
-                # Get the name of the original sender for a personal touch
                 sender_name = re.match(r'"?(.*?)"?\s*<', original_from_header)
                 recipient_name = sender_name.group(1) if sender_name else "there"
 
@@ -400,7 +403,6 @@ def process_email_request():
                 
                 email_message = create_threaded_email(agent_email, to_field, cc_field, clean_subject, html_body, in_reply_to=message_id_header, references=new_references)
                 send_email(gmail_service, 'me', email_message)
-                gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
                 print(f"Sent time slot suggestions to {to_field}")
             else:
                  print("No available slots found matching the criteria.")
