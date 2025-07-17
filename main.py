@@ -341,38 +341,47 @@ def process_email_request():
 
         hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', full_email_text)
 
+        # --- FIX: Robust reply detection ---
         if hidden_data_matches and owner_email not in original_from_header:
             print("Detected reply to agent. Attempting to schedule event.")
             
+            # --- FIX: Use AI to understand natural language confirmation ---
             possible_slots_text = ""
-            for i, hidden_info_str in enumerate(hidden_data_matches):
+            for hidden_info_str in hidden_data_matches:
                 slot_data = json.loads(hidden_info_str)
                 start_time_et = ET.localize(datetime.fromisoformat(slot_data['start']))
-                possible_slots_text += f"Option {i+1}: {start_time_et.strftime('%A, %B %d at %I:%M %p ET')} for {slot_data['duration']} minutes.\n"
+                possible_slots_text += f"- {start_time_et.strftime('%A, %B %d at %I:%M %p ET')} for {slot_data['duration']} minutes.\n"
             
             gemini_api_key = os.environ.get("GEMINI_API_KEY")
             genai.configure(api_key=gemini_api_key)
             model = genai.GenerativeModel('gemini-1.5-flash-latest')
             prompt = f"""
-            Read the user's reply to determine which option they chose for the meeting.
-            The options offered were:
+            Read the user's reply and determine if they confirmed one of the proposed meeting times.
+            The original options were:
             {possible_slots_text}
             The user's reply is: "{full_email_text}"
-            Respond with a JSON object containing one key: "chosen_option_number".
-            The value should be the integer of the chosen option (e.g., 1, 2, or 3). If the user mentions a specific date or day that matches an option, use that option number.
-            If the user did not clearly choose an option, respond with null.
+            
+            Respond with a JSON object containing one key: "confirmed_start_time_iso".
+            The value should be the ISO 8601 formatted string of the chosen time slot (e.g., "2025-07-25T09:30:00-04:00").
+            If the user did not clearly confirm one of the options, the value should be null.
             JSON:
             """
             response = model.generate_content(prompt)
             json_str = response.text.strip().replace('```json', '').replace('```', '').strip()
             choice_data = json.loads(json_str)
-            chosen_option = choice_data.get('chosen_option_number')
+            confirmed_start_time_iso = choice_data.get('confirmed_start_time_iso')
 
-            if chosen_option and len(hidden_data_matches) >= chosen_option:
-                event_data = json.loads(hidden_data_matches[chosen_option - 1])
-                start_time_et = ET.localize(datetime.fromisoformat(event_data['start']))
-                duration = event_data['duration']
+            if confirmed_start_time_iso:
+                start_time_et = ET.localize(datetime.fromisoformat(confirmed_start_time_iso))
                 
+                # Find the duration from the original hidden data
+                duration = 60 # default
+                for hidden_info_str in hidden_data_matches:
+                    event_data = json.loads(hidden_info_str)
+                    if event_data['start'] == confirmed_start_time_iso:
+                        duration = event_data['duration']
+                        break
+
                 all_emails_str = original_to + "," + original_cc + "," + original_from_header
                 attendees = list(set(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', all_emails_str)))
                 if owner_email not in attendees:
@@ -385,7 +394,7 @@ def process_email_request():
                  print("Could not determine user's choice from reply. Will fall through and re-suggest.")
         
         # This logic now correctly runs only for initial requests OR if the reply was unclear
-        if not (hidden_data_matches and owner_email not in original_from_header and chosen_option):
+        if not (hidden_data_matches and owner_email not in original_from_header):
             print("Detected initial request or unclear reply. Finding slots.")
             preferences = get_email_intent_with_ai(full_email_text, datetime.now(ET), gemini_api_key)
             available_slots = find_available_slots(calendar_service, owner_email, preferences)
@@ -451,4 +460,3 @@ def process_email_request():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(debug=True, host='0.0.0.0', port=port)
-
