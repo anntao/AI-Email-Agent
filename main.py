@@ -14,10 +14,10 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from google.cloud import secretmanager
+from google.cloud import firestore
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import time as sleep_timer
-from collections import deque
 
 # --- Flask App Initialization ---
 app = Flask(__name__)
@@ -27,9 +27,6 @@ SCOPES = ['https://mail.google.com/', 'https://www.googleapis.com/auth/calendar'
 ET = pytz.timezone('America/New_York')
 WORK_START_HOUR_ET = 9.5  # 9:30 AM
 WORK_END_HOUR_ET = 18.0   # 6:00 PM
-
-# --- In-memory cache for deduplication ---
-PROCESSED_MESSAGE_IDS = deque(maxlen=100) # Store the last 100 message IDs
 
 # --- Helper function to get secrets ---
 def get_secret(project_id, secret_id, version_id="latest"):
@@ -202,6 +199,7 @@ def create_threaded_email(sender, to, cc, subject, html_body, in_reply_to, refer
     message['subject'] = subject
     message['In-Reply-To'] = in_reply_to
     message['References'] = references
+    message['X-Agent-Processed'] = 'true'
     
     message.attach(MIMEText(html_body, 'html'))
     return {'raw': base64.urlsafe_b64encode(message.as_bytes()).decode()}
@@ -258,19 +256,38 @@ def process_email_request():
     
     try:
         _, project_id = google.auth.default()
+        db = firestore.Client(project=project_id)
     except google.auth.exceptions.DefaultCredentialsError:
         print("ERROR: Could not automatically determine project ID.")
         return "Internal Server Error", 500
 
     gemini_api_key = os.environ.get("GEMINI_API_KEY")
     
-    pubsub_message_id = envelope['message'].get('messageId')
-    if pubsub_message_id:
-        if pubsub_message_id in PROCESSED_MESSAGE_IDS:
-            print(f"Duplicate Pub/Sub message ID detected: {pubsub_message_id}. Ignoring.")
-            return "Duplicate message", 200
-        PROCESSED_MESSAGE_IDS.append(pubsub_message_id)
+    try:
+        data = json.loads(base64.b64decode(envelope['message']['data']).decode('utf-8'))
+        history_id = str(data['historyId'])
+        doc_ref = db.collection('processed_history').document(history_id)
+        
+        @firestore.transactional
+        def check_and_set_history(transaction, doc_ref):
+            snapshot = doc_ref.get(transaction=transaction)
+            if snapshot.exists:
+                return True
+            else:
+                transaction.set(doc_ref, {'timestamp': firestore.SERVER_TIMESTAMP})
+                return False
 
+        transaction = db.transaction()
+        is_duplicate = check_and_set_history(transaction, doc_ref)
+
+        if is_duplicate:
+            print(f"Duplicate historyId detected: {history_id}. Ignoring.")
+            return "Duplicate message", 200
+
+    except Exception as e:
+        print(f"Firestore deduplication check failed: {e}")
+        return "Internal Server Error", 500
+    
     sleep_timer.sleep(5)
     
     agent_email = 'anntaoai@gmail.com'
@@ -289,30 +306,25 @@ def process_email_request():
         return "Service build failed.", 500
 
     try:
-        data = json.loads(base64.b64decode(envelope['message']['data']).decode('utf-8'))
-        history_id = data['historyId']
+        list_response = gmail_service.users().messages().list(userId='me', q='is:unread', maxResults=1).execute()
+        if not list_response.get('messages'):
+            print("No new unread messages found.")
+            return "No unread messages.", 200
         
-        history = gmail_service.users().history().list(userId='me', startHistoryId=history_id).execute()
-        
-        messages_added = []
-        if 'history' in history:
-            for h in history['history']:
-                messages_added.extend(h.get('messagesAdded', []))
-
-        if not messages_added:
-            print("No message was added in this history event.")
-            return "No message added.", 200
-
-        msg_id = messages_added[0]['message']['id']
+        msg_id = list_response['messages'][0]['id']
         
         message = gmail_service.users().messages().get(userId='me', id=msg_id, format='full').execute()
         
-        # Mark as read immediately to avoid race conditions
+        headers = message['payload']['headers']
+        is_agent_sent = any(h['name'] == 'X-Agent-Processed' and h['value'] == 'true' for h in headers)
+        if is_agent_sent:
+            print(f"Ignoring agent's own message: {msg_id}")
+            gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
+            return "Agent message ignored.", 200
+
         gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
         
-        headers = message['payload']['headers']
         subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
-        
         full_email_text = get_full_email_text(message['payload'])
         
         message_id_header = next((h['value'] for h in headers if h['name'].lower() == 'message-id'), None)
@@ -328,7 +340,6 @@ def process_email_request():
              return "Owner not in thread, request ignored.", 200
 
         hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', full_email_text)
-
         is_reply_to_agent = "AI assistant" in full_email_text and hidden_data_matches and owner_email not in original_from_header
 
         if is_reply_to_agent:
@@ -361,11 +372,11 @@ def process_email_request():
                 start_time_et = ET.localize(datetime.fromisoformat(event_data['start']))
                 duration = event_data['duration']
                 
-                all_emails = set(re.findall(r'<([^>]+)>', original_to + original_cc + original_from_header))
-                all_emails.update(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', original_to + original_cc + original_from_header))
-                attendees = [email for email in all_emails if email != agent_email]
+                all_emails_str = original_to + "," + original_cc + "," + original_from_header
+                attendees = list(set(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', all_emails_str)))
                 if owner_email not in attendees:
                     attendees.append(owner_email)
+                attendees = [email for email in attendees if email != agent_email]
 
                 create_calendar_event(calendar_service, owner_email, f"Meeting: {subject.replace('Re: ', '')}", start_time_et, duration, attendees)
                 print(f"Event scheduled with {', '.join(attendees)}")
@@ -412,13 +423,12 @@ def process_email_request():
 
                 clean_subject = f"Re: {subject.replace('Re: ', '')}"
                 
-                all_emails = set(re.findall(r'<([^>]+)>', original_to + original_cc + original_from_header))
-                all_emails.update(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', original_to + original_cc + original_from_header))
-                participants = [email for email in all_emails if email != agent_email]
-                if owner_email not in participants:
-                     participants.append(owner_email)
-
-                to_field = ", ".join(p for p in participants if p != owner_email)
+                all_emails_str = original_to + "," + original_cc + "," + original_from_header
+                all_emails = list(set(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', all_emails_str)))
+                
+                participants = [email for email in all_emails if email not in [agent_email, owner_email]]
+                
+                to_field = ", ".join(participants)
                 cc_field = owner_email
                 
                 email_message = create_threaded_email(agent_email, to_field, cc_field, clean_subject, html_body, in_reply_to=message_id_header, references=new_references)
@@ -437,4 +447,5 @@ def process_email_request():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(debug=True, host='0.0.0.0', port=port)
+```
 
