@@ -42,13 +42,7 @@ def get_secret(project_id, secret_id, version_id="latest"):
 
 def authenticate_with_secrets(project_id):
     """Authenticates with Google APIs using credentials from Secret Manager."""
-    creds = None
-    if not project_id:
-        print("ERROR: GCP_PROJECT could not be determined.")
-        return None
-
     token_json_str = get_secret(project_id, "agent-token-json")
-    
     if not token_json_str:
         print("ERROR: Could not retrieve token from Secret Manager.")
         return None
@@ -56,20 +50,14 @@ def authenticate_with_secrets(project_id):
     try:
         creds_info = json.loads(token_json_str)
         creds = Credentials.from_authorized_user_info(creds_info, SCOPES)
-    except Exception as e:
-        print(f"ERROR: Could not load credentials from secret data. Error: {e}")
-        return None
-
-    if creds and creds.expired and creds.refresh_token:
-        try:
+        if creds.expired and creds.refresh_token:
             print("Token expired, attempting to refresh...")
             creds.refresh(Request())
             print("Token refreshed successfully for this session.")
-        except Exception as e:
-            print(f"ERROR: Could not refresh token. A new token may need to be generated manually. Error: {e}")
-            return None
-            
-    return creds
+        return creds
+    except Exception as e:
+        print(f"ERROR: Could not load or refresh credentials. Error: {e}")
+        return None
 
 def get_email_intent_with_ai(email_thread_text, current_date_et, api_key):
     """Uses Gemini to parse the user's intent from the full email thread."""
@@ -372,8 +360,8 @@ def process_email_request():
             choice_data = json.loads(json_str)
             confirmed_start_time_iso = choice_data.get('confirmed_start_time_iso')
 
+            # --- FIX: Logic to handle confirmed time ---
             if confirmed_start_time_iso:
-                # Find the duration from the original hidden data by matching the confirmed ISO string
                 duration = 60 # default
                 found_match = False
                 for hidden_info_str in hidden_data_matches:
@@ -393,13 +381,15 @@ def process_email_request():
 
                     create_calendar_event(calendar_service, owner_email, f"Meeting: {subject.replace('Re: ', '')}", start_time_et, duration, attendees)
                     print(f"Event scheduled with {', '.join(attendees)}")
+                    return "Event Scheduled", 200 # End execution after scheduling
                 else:
                     print(f"AI returned a time ({confirmed_start_time_iso}) that was not in the original options. Re-suggesting.")
             else:
                  print("Could not determine user's choice from reply. Re-suggesting.")
         
         # This logic now correctly runs only for initial requests OR if the reply was unclear or mismatched
-        if not (hidden_data_matches and owner_email not in original_from_header and confirmed_start_time_iso):
+        # --- FIX: The `if` condition was flawed, corrected to a simple `else` ---
+        else:
             print("Detected initial request or unclear reply. Finding slots.")
             preferences = get_email_intent_with_ai(full_email_text, datetime.now(ET), gemini_api_key)
             available_slots = find_available_slots(calendar_service, owner_email, preferences)
