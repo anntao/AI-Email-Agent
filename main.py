@@ -281,6 +281,7 @@ def process_email_request():
         return "Service build failed.", 500
 
     try:
+        # --- FIX: Mark as read immediately to prevent double processing ---
         list_response = gmail_service.users().messages().list(userId='me', q='is:unread', maxResults=1).execute()
         if not list_response.get('messages'):
             print("No new unread messages found.")
