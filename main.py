@@ -111,6 +111,11 @@ def find_available_slots(service, calendar_id, preferences):
     """Finds available slots based on AI-parsed preferences, skipping weekends."""
     duration_minutes = preferences.get('duration') or 60
     day_preference = preferences.get('day_preference')
+    
+    # --- FIX: Handle case where AI returns a list for day_preference ---
+    if isinstance(day_preference, list):
+        day_preference = day_preference[0] if day_preference else None
+
     time_of_day = preferences.get('time_of_day')
     start_date_str = preferences.get('start_date')
 
