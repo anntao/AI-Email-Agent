@@ -67,7 +67,7 @@ def get_conversation_intent_with_ai(email_thread_text, current_date_et, api_key)
 
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-pro-latest') 
+        model = genai.GenerativeModel('gemini-2.5-flash') 
         
         prompt = f"""
         Analyze the following email thread to determine the user's current intent. The current date is {current_date_et.strftime('%Y-%m-%d')}.
@@ -396,7 +396,7 @@ def process_email_request():
                 recipient_name = sender_name_match.group(1).strip() if sender_name_match else "there"
 
                 genai.configure(api_key=gemini_api_key)
-                model = genai.GenerativeModel('gemini-1.5-pro-latest')
+                model = genai.GenerativeModel('gemini-2.5-flash')
                 prompt = f"""
                 You are a helpful AI assistant for {owner_name}.
                 Write a brief, friendly, and natural-sounding email to {recipient_name} to propose meeting times.
