@@ -72,16 +72,23 @@ def get_conversation_intent_with_ai(email_thread_text, current_date_et, api_key)
         prompt = f"""
         Analyze the following email thread to determine the user's current intent. The current date is {current_date_et.strftime('%Y-%m-%d')}.
 
-        There are three possible intents:
+        There are four possible intents:
         1. "INITIAL_REQUEST": The user is starting a new request to schedule a meeting. Extract their preferences (duration, day_preference, time_of_day, start_date).
         2. "CONFIRMATION": The user is replying to confirm a specific time slot that was previously offered. Extract the exact ISO 8601 formatted string of the confirmed time.
-        3. "OTHER": The email is not related to scheduling, or it's a negotiation where no specific time was chosen.
+        3. "DAY_CONFIRMATION": The user is confirming a specific day (e.g., "Tuesday works", "Monday is good") but not a specific time. Extract the day name and optionally a time preference.
+        4. "OTHER": The email is not related to scheduling, or it's a negotiation where no specific time was chosen.
 
         The agent's previous suggestions are embedded in HTML comments like <!-- data: {{"start": "...", "duration": ...}} -->. Use these to identify if the current email is a reply to suggestions.
 
+        IMPORTANT: 
+        - For CONFIRMATION intent, the confirmed_start_time_iso must be in ISO 8601 format with timezone (e.g., "2024-01-15T14:30:00-05:00" for 2:30 PM ET). 
+        - For DAY_CONFIRMATION intent, return the day name and optionally time_of_day preference.
+        - If the user mentions a time without timezone, assume Eastern Time (ET).
+
         Respond with a JSON object with two keys: "intent" and "data".
         - If intent is "INITIAL_REQUEST", "data" should be a JSON object with scheduling preferences.
-        - If intent is "CONFIRMATION", "data" should be a JSON object with the key "confirmed_start_time_iso".
+        - If intent is "CONFIRMATION", "data" should be a JSON object with the key "confirmed_start_time_iso" containing the exact time in ISO 8601 format.
+        - If intent is "DAY_CONFIRMATION", "data" should be a JSON object with keys "day_name" (e.g., "tuesday", "monday") and optionally "time_of_day" (e.g., "morning", "afternoon").
         - If intent is "OTHER", "data" can be null.
 
         Email Thread:
@@ -347,26 +354,53 @@ def process_email_request():
             if confirmed_start_time_iso:
                 print(f"AI returned confirmed time: {confirmed_start_time_iso}")
                 hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', full_email_text)
+                print(f"Found {len(hidden_data_matches)} hidden data matches in email")
                 duration = 60 
                 found_match = False
                 
-                # --- FIX: Normalize datetimes by rounding to the minute before comparing ---
-                confirmed_dt_rounded = datetime.fromisoformat(confirmed_start_time_iso).astimezone(ET).replace(second=0, microsecond=0)
+                # Parse the confirmed time from AI
+                try:
+                    confirmed_dt = datetime.fromisoformat(confirmed_start_time_iso)
+                    if confirmed_dt.tzinfo is None:
+                        # If no timezone info, assume it's in ET
+                        confirmed_dt = ET.localize(confirmed_dt)
+                    else:
+                        # Convert to ET
+                        confirmed_dt = confirmed_dt.astimezone(ET)
+                    confirmed_dt_rounded = confirmed_dt.replace(second=0, microsecond=0)
+                    print(f"Parsed confirmed time (ET): {confirmed_dt_rounded}")
+                except Exception as e:
+                    print(f"Error parsing confirmed time: {e}")
+                    return "Error parsing confirmed time", 500
 
-                for hidden_info_str in hidden_data_matches:
-                    event_data = json.loads(hidden_info_str)
-                    event_dt_rounded = datetime.fromisoformat(event_data['start']).astimezone(ET).replace(second=0, microsecond=0)
-                    
-                    # --- FIX: Add debug print statement ---
-                    print(f"Comparing: AI='{confirmed_dt_rounded}' vs Option='{event_dt_rounded}'")
+                for i, hidden_info_str in enumerate(hidden_data_matches):
+                    try:
+                        event_data = json.loads(hidden_info_str)
+                        print(f"Hidden data {i+1}: {event_data}")
+                        
+                        event_dt = datetime.fromisoformat(event_data['start'])
+                        if event_dt.tzinfo is None:
+                            # If no timezone info, assume it's in ET
+                            event_dt = ET.localize(event_dt)
+                        else:
+                            # Convert to ET
+                            event_dt = event_dt.astimezone(ET)
+                        event_dt_rounded = event_dt.replace(second=0, microsecond=0)
+                        
+                        print(f"Comparing: AI='{confirmed_dt_rounded}' vs Option='{event_dt_rounded}' (match: {confirmed_dt_rounded == event_dt_rounded})")
 
-                    if event_dt_rounded == confirmed_dt_rounded:
-                        duration = event_data['duration']
-                        found_match = True
-                        break
+                        if confirmed_dt_rounded == event_dt_rounded:
+                            duration = event_data['duration']
+                            found_match = True
+                            print(f"Found matching slot! Duration: {duration} minutes")
+                            break
+                    except Exception as e:
+                        print(f"Error parsing hidden data {i+1}: {e}")
+                        continue
                 
                 if found_match:
-                    start_time_et = ET.localize(datetime.fromisoformat(confirmed_start_time_iso))
+                    # Use the confirmed datetime directly since we already parsed it
+                    start_time_et = confirmed_dt
                     all_emails_str = original_to + "," + original_cc + "," + original_from_header
                     attendees = list(set(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', all_emails_str)))
                     if owner_email not in attendees:
@@ -377,6 +411,78 @@ def process_email_request():
                     print(f"Event scheduled with {', '.join(attendees)}")
                 else:
                     print(f"AI confirmed a time ({confirmed_start_time_iso}), but it was not one of the options offered. Ignoring.")
+                    print(f"Available options were: {[datetime.fromisoformat(json.loads(match)['start']).astimezone(ET).strftime('%Y-%m-%d %H:%M ET') for match in hidden_data_matches]}")
+
+        elif intent == "DAY_CONFIRMATION":
+            print("AI detected DAY_CONFIRMATION intent.")
+            day_name = intent_data.get('day_name') if intent_data else None
+            time_of_day = intent_data.get('time_of_day') if intent_data else None
+
+            if day_name:
+                print(f"User confirmed day: {day_name}, time preference: {time_of_day}")
+                hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', full_email_text)
+                print(f"Found {len(hidden_data_matches)} hidden data matches in email")
+                
+                # Find the next occurrence of this day
+                weekday_map = {
+                    'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3, 'friday': 4
+                }
+                target_weekday = weekday_map.get(day_name.lower())
+                
+                if target_weekday is None:
+                    print(f"Invalid day name: {day_name}")
+                    return "Invalid day name", 400
+                
+                # Find matching slots for this day
+                matching_slots = []
+                for hidden_info_str in hidden_data_matches:
+                    try:
+                        event_data = json.loads(hidden_info_str)
+                        event_dt = datetime.fromisoformat(event_data['start'])
+                        if event_dt.tzinfo is None:
+                            event_dt = ET.localize(event_dt)
+                        else:
+                            event_dt = event_dt.astimezone(ET)
+                        
+                        # Check if this slot is on the target day
+                        if event_dt.weekday() == target_weekday:
+                            # If user specified time_of_day preference, filter by that
+                            if time_of_day:
+                                hour = event_dt.hour
+                                if time_of_day == "morning" and hour >= 12:
+                                    continue
+                                elif time_of_day == "afternoon" and hour < 12:
+                                    continue
+                            
+                            matching_slots.append({
+                                'datetime': event_dt,
+                                'duration': event_data['duration']
+                            })
+                    except Exception as e:
+                        print(f"Error parsing hidden data: {e}")
+                        continue
+                
+                if matching_slots:
+                    # Sort by time and take the first one
+                    matching_slots.sort(key=lambda x: x['datetime'])
+                    selected_slot = matching_slots[0]
+                    
+                    print(f"Selected slot for {day_name}: {selected_slot['datetime'].strftime('%A, %B %d at %I:%M %p ET')}")
+                    
+                    # Schedule the meeting
+                    all_emails_str = original_to + "," + original_cc + "," + original_from_header
+                    attendees = list(set(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', all_emails_str)))
+                    if owner_email not in attendees:
+                        attendees.append(owner_email)
+                    attendees = [email for email in attendees if email != agent_email]
+
+                    create_calendar_event(calendar_service, owner_email, f"Meeting: {subject.replace('Re: ', '')}", 
+                                       selected_slot['datetime'], selected_slot['duration'], attendees)
+                    print(f"Event scheduled with {', '.join(attendees)}")
+                else:
+                    print(f"No available slots found for {day_name} with time preference: {time_of_day}")
+            else:
+                print("AI detected DAY_CONFIRMATION but no day_name provided")
 
         elif intent == "INITIAL_REQUEST" or intent == "OTHER":
             print(f"AI detected {intent} intent. Finding slots.")
@@ -439,6 +545,11 @@ def process_email_request():
         return "An error occurred.", 500
 
     return "Processing complete.", 200
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint for Cloud Run."""
+    return 'OK', 200
 
 # This block is essential for the server to start.
 if __name__ == "__main__":
