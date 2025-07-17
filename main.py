@@ -17,6 +17,7 @@ from google.cloud import secretmanager
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import time as sleep_timer # Renamed to avoid conflict with time object
+from collections import deque
 
 # --- Flask App Initialization ---
 app = Flask(__name__)
@@ -26,6 +27,9 @@ SCOPES = ['https://mail.google.com/', 'https://www.googleapis.com/auth/calendar'
 ET = pytz.timezone('America/New_York')
 WORK_START_HOUR_ET = 9.5  # 9:30 AM
 WORK_END_HOUR_ET = 18.0   # 6:00 PM
+
+# --- In-memory cache for deduplication ---
+PROCESSED_MESSAGE_IDS = deque(maxlen=100) # Store the last 100 message IDs
 
 # --- Helper function to get secrets ---
 def get_secret(project_id, secret_id, version_id="latest"):
@@ -258,12 +262,29 @@ def get_full_email_text(payload):
 @app.route('/', methods=['POST'])
 def process_email_request():
     """Entry point for all requests, triggered by Pub/Sub."""
-    sleep_timer.sleep(5)
     
     envelope = request.get_json()
     if not envelope or 'message' not in envelope:
         print('Invalid Pub/Sub message format. This may be a health check.')
         return 'OK', 200
+        
+    # --- FIX: Deduplication logic using message ID from Pub/Sub payload ---
+    try:
+        data = json.loads(base64.b64decode(envelope['message']['data']).decode('utf-8'))
+        # This is the unique ID for the history event, not the message itself yet
+        # We'll use this as a proxy for the message ID for deduplication
+        event_id = envelope['message']['messageId'] 
+        if event_id in PROCESSED_MESSAGE_IDS:
+            print(f"Duplicate Pub/Sub message received: {event_id}. Ignoring.")
+            return "Duplicate message", 200
+        PROCESSED_MESSAGE_IDS.append(event_id)
+    except Exception as e:
+        print(f"Could not decode Pub/Sub message: {e}")
+        return "Bad Request", 400
+
+
+    # Wait for API to sync
+    sleep_timer.sleep(5)
     
     agent_email = 'anntaoai@gmail.com'
     owner_email = 'anntaod@gmail.com'
@@ -281,16 +302,25 @@ def process_email_request():
         return "Service build failed.", 500
 
     try:
-        # --- FIX: Mark as read immediately to prevent double processing ---
-        list_response = gmail_service.users().messages().list(userId='me', q='is:unread', maxResults=1).execute()
-        if not list_response.get('messages'):
-            print("No new unread messages found.")
-            return "No unread messages.", 200
+        # Use historyId from Pub/Sub to get the specific new message
+        history_id = data['historyId']
+        history = gmail_service.users().history().list(userId='me', startHistoryId=history_id).execute()
         
-        msg_id = list_response['messages'][0]['id']
-        gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
-        print(f"Marked message {msg_id} as read to prevent reprocessing.")
+        messages_added = []
+        if 'history' in history:
+            for h in history['history']:
+                messages_added.extend(h.get('messagesAdded', []))
 
+        if not messages_added:
+            print("No message was added in this history event.")
+            return "No message added.", 200
+
+        # Process the first new message found
+        msg_id = messages_added[0]['message']['id']
+
+        # Mark as read to be safe, though deduplication is primary
+        gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
+        
         message = gmail_service.users().messages().get(userId='me', id=msg_id, format='full').execute()
         
         headers = message['payload']['headers']
@@ -312,7 +342,6 @@ def process_email_request():
 
         hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', full_email_text)
 
-        # --- FIX: Logic to handle replies ---
         is_reply_to_agent = "AI assistant" in full_email_text and hidden_data_matches
 
         if is_reply_to_agent:
@@ -345,7 +374,6 @@ def process_email_request():
                 start_time_et = ET.localize(datetime.fromisoformat(event_data['start']))
                 duration = event_data['duration']
                 
-                # Correctly identify all participants for the final invite
                 all_emails = set(re.findall(r'<([^>]+)>', original_to + original_cc + original_from_header))
                 all_emails.update(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', original_to + original_cc + original_from_header))
                 attendees = [email for email in all_emails if email != agent_email]
@@ -355,7 +383,7 @@ def process_email_request():
                 create_calendar_event(calendar_service, owner_email, f"Meeting: {subject.replace('Re: ', '')}", start_time_et, duration, attendees)
                 print(f"Event scheduled with {', '.join(attendees)}")
         
-        else: # This is an initial request
+        else:
             print("Detected initial request. Finding slots.")
             preferences = get_email_intent_with_ai(full_email_text, datetime.now(ET))
             available_slots = find_available_slots(calendar_service, owner_email, preferences)
