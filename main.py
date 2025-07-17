@@ -67,7 +67,7 @@ def get_email_intent_with_ai(email_thread_text, current_date_et, api_key):
         
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash-latest')
+        model = genai.GenerativeModel('gemini-2.5-flash')
         prompt = f"""
         Analyze the following email thread to determine scheduling preferences. The current date is {current_date_et.strftime('%Y-%m-%d')}.
         Your goal is to be a helpful assistant.
@@ -329,18 +329,15 @@ def process_email_request():
 
         hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', full_email_text)
 
-        # --- FIX: Robust reply detection ---
-        if hidden_data_matches and owner_email not in original_from_header:
+        if hidden_data_matches and agent_email in original_to:
             print("Detected reply to agent. Attempting to schedule event.")
             
-            # --- FIX: Use AI to understand natural language confirmation ---
             possible_slots_text = ""
             for hidden_info_str in hidden_data_matches:
                 slot_data = json.loads(hidden_info_str)
                 start_time_et = ET.localize(datetime.fromisoformat(slot_data['start']))
                 possible_slots_text += f"- {start_time_et.strftime('%A, %B %d at %I:%M %p ET')} ({slot_data['start']})\n"
             
-            gemini_api_key = os.environ.get("GEMINI_API_KEY")
             genai.configure(api_key=gemini_api_key)
             model = genai.GenerativeModel('gemini-1.5-flash-latest')
             prompt = f"""
@@ -360,7 +357,6 @@ def process_email_request():
             choice_data = json.loads(json_str)
             confirmed_start_time_iso = choice_data.get('confirmed_start_time_iso')
 
-            # --- FIX: Logic to handle confirmed time ---
             if confirmed_start_time_iso:
                 duration = 60 # default
                 found_match = False
@@ -381,16 +377,13 @@ def process_email_request():
 
                     create_calendar_event(calendar_service, owner_email, f"Meeting: {subject.replace('Re: ', '')}", start_time_et, duration, attendees)
                     print(f"Event scheduled with {', '.join(attendees)}")
-                    return "Event Scheduled", 200 # End execution after scheduling
                 else:
                     print(f"AI returned a time ({confirmed_start_time_iso}) that was not in the original options. Re-suggesting.")
             else:
                  print("Could not determine user's choice from reply. Re-suggesting.")
         
-        # This logic now correctly runs only for initial requests OR if the reply was unclear or mismatched
-        # --- FIX: The `if` condition was flawed, corrected to a simple `else` ---
         else:
-            print("Detected initial request or unclear reply. Finding slots.")
+            print("Detected initial request. Finding slots.")
             preferences = get_email_intent_with_ai(full_email_text, datetime.now(ET), gemini_api_key)
             available_slots = find_available_slots(calendar_service, owner_email, preferences)
             
