@@ -14,10 +14,10 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from google.cloud import secretmanager
-from google.cloud import firestore
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import time as sleep_timer
+from collections import deque
 
 # --- Flask App Initialization ---
 app = Flask(__name__)
@@ -27,6 +27,9 @@ SCOPES = ['https://mail.google.com/', 'https://www.googleapis.com/auth/calendar'
 ET = pytz.timezone('America/New_York')
 WORK_START_HOUR_ET = 9.5  # 9:30 AM
 WORK_END_HOUR_ET = 18.0   # 6:00 PM
+
+# --- In-memory cache for deduplication ---
+PROCESSED_MESSAGE_IDS = deque(maxlen=100) # Store the last 100 message IDs
 
 # --- Helper function to get secrets ---
 def get_secret(project_id, secret_id, version_id="latest"):
@@ -253,43 +256,21 @@ def process_email_request():
         print('Invalid Pub/Sub message format. This may be a health check.')
         return 'OK', 200
     
-    # --- FIX: Moved environment discovery inside the request handler ---
     try:
         _, project_id = google.auth.default()
     except google.auth.exceptions.DefaultCredentialsError:
         print("ERROR: Could not automatically determine project ID.")
         return "Internal Server Error", 500
 
-    # FIX: Initialize Firestore client inside the request handler
-    db = firestore.Client(project=project_id)
     gemini_api_key = os.environ.get("GEMINI_API_KEY")
     
-    # --- FIX: Use Firestore for robust deduplication ---
-    try:
-        data = json.loads(base64.b64decode(envelope['message']['data']).decode('utf-8'))
-        history_id = str(data['historyId']) # Ensure historyId is a string
-        doc_ref = db.collection('processed_history').document(history_id)
-        
-        @firestore.transactional
-        def check_and_set_history(transaction, doc_ref):
-            snapshot = doc_ref.get(transaction=transaction)
-            if snapshot.exists:
-                return True # Indicates duplicate
-            else:
-                transaction.set(doc_ref, {'timestamp': firestore.SERVER_TIMESTAMP})
-                return False # Indicates not a duplicate
-
-        transaction = db.transaction()
-        is_duplicate = check_and_set_history(transaction, doc_ref)
-
-        if is_duplicate:
-            print(f"Duplicate historyId detected: {history_id}. Ignoring.")
+    pubsub_message_id = envelope['message'].get('messageId')
+    if pubsub_message_id:
+        if pubsub_message_id in PROCESSED_MESSAGE_IDS:
+            print(f"Duplicate Pub/Sub message ID detected: {pubsub_message_id}. Ignoring.")
             return "Duplicate message", 200
+        PROCESSED_MESSAGE_IDS.append(pubsub_message_id)
 
-    except Exception as e:
-        print(f"Firestore deduplication check failed: {e}")
-        return "Internal Server Error", 500
-    
     sleep_timer.sleep(5)
     
     agent_email = 'anntaoai@gmail.com'
@@ -308,13 +289,22 @@ def process_email_request():
         return "Service build failed.", 500
 
     try:
-        # Get the specific message that triggered the event
-        list_response = gmail_service.users().messages().list(userId='me', q='is:unread', maxResults=1).execute()
-        if not list_response.get('messages'):
-            print("No new unread messages found.")
-            return "No unread messages.", 200
+        data = json.loads(base64.b64decode(envelope['message']['data']).decode('utf-8'))
+        history_id = data['historyId']
         
-        msg_id = list_response['messages'][0]['id']
+        history = gmail_service.users().history().list(userId='me', startHistoryId=history_id).execute()
+        
+        messages_added = []
+        if 'history' in history:
+            for h in history['history']:
+                messages_added.extend(h.get('messagesAdded', []))
+
+        if not messages_added:
+            print("No message was added in this history event.")
+            return "No message added.", 200
+
+        msg_id = messages_added[0]['message']['id']
+        
         message = gmail_service.users().messages().get(userId='me', id=msg_id, format='full').execute()
         
         # Mark as read immediately to avoid race conditions
