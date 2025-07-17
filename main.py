@@ -358,7 +358,7 @@ def process_email_request():
                     event_dt_rounded = datetime.fromisoformat(event_data['start']).astimezone(ET).replace(second=0, microsecond=0)
                     
                     # --- FIX: Add debug print statement ---
-                    print(f"Comparing: AI='{confirmed_dt_rounded}' vs Option='{event_dt_rounded}'")
+                    print(f"DEBUG: Comparing AI='{confirmed_dt_rounded}' vs Option='{event_dt_rounded}'")
 
                     if event_dt_rounded == confirmed_dt_rounded:
                         duration = event_data['duration']
