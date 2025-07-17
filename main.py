@@ -95,7 +95,8 @@ def get_email_intent_with_ai(email_thread_text):
         
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel('gemini-pro')
+        # --- CORRECTED MODEL NAME ---
+        model = genai.GenerativeModel('gemini-1.5-flash-latest')
         prompt = f"""
         Analyze the following email thread to determine scheduling preferences.
         Your goal is to be a helpful assistant.
@@ -276,8 +277,21 @@ def process_email_request():
         
         headers = message['payload']['headers']
         subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
-        snippet = message.get('snippet', '')
         
+        # --- CORRECTED: Use full body for AI context ---
+        full_email_text = ""
+        if 'parts' in message['payload']:
+            for part in message['payload']['parts']:
+                if part['mimeType'] == 'text/plain':
+                    body_data = part['body'].get('data')
+                    if body_data:
+                        full_email_text += base64.urlsafe_b64decode(body_data).decode('utf-8')
+        else:
+             body_data = message['payload']['body'].get('data')
+             if body_data:
+                full_email_text = base64.urlsafe_b64decode(body_data).decode('utf-8')
+
+
         message_id_header = next((h['value'] for h in headers if h['name'].lower() == 'message-id'), None)
         references_header = next((h['value'] for h in headers if h['name'].lower() == 'references'), '')
         new_references = f"{references_header} {message_id_header}".strip()
@@ -285,9 +299,9 @@ def process_email_request():
         # --- CORRECTED OWNER CHECK ---
         original_to = next((h['value'] for h in headers if h['name'].lower() == 'to'), '')
         original_cc = next((h['value'] for h in headers if h['name'].lower() == 'cc'), '')
-        original_from = next((h['value'] for h in headers if h['name'].lower() == 'from'), '')
+        original_from_header = next((h['value'] for h in headers if h['name'].lower() == 'from'), '')
         
-        if owner_email not in (original_to + original_cc + original_from):
+        if owner_email not in (original_to + original_cc + original_from_header):
              print(f"Owner ({owner_email}) not in participants (To, From, Cc). Ignoring email.")
              gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
              return "Owner not in thread, request ignored.", 200
@@ -295,12 +309,6 @@ def process_email_request():
         # --- AI-powered Reply Parsing ---
         if "Re:" in subject and "AI assistant" in snippet:
             hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', str(message['payload']))
-            
-            body_parts = message['payload'].get('parts', [])
-            body = ""
-            if body_parts:
-                body_data = body_parts[0]['body'].get('data')
-                body = base64.urlsafe_b64decode(body_data).decode('utf-8') if body_data else ""
             
             if hidden_data_matches:
                 possible_slots_text = ""
@@ -310,13 +318,14 @@ def process_email_request():
                     possible_slots_text += f"Option {i+1}: {start_time_et.strftime('%A, %B %d at %I:%M %p ET')} for {slot_data['duration']} minutes.\n"
                 
                 genai.configure(api_key=GEMINI_API_KEY)
-                model = genai.GenerativeModel('gemini-pro')
+                # --- CORRECTED MODEL NAME ---
+                model = genai.GenerativeModel('gemini-1.5-flash-latest')
                 prompt = f"""
                 Read the user's reply to determine which option they chose for the meeting.
                 The options offered were:
                 {possible_slots_text}
 
-                The user's reply is: "{body}"
+                The user's reply is: "{full_email_text}"
 
                 Respond with a JSON object containing one key: "chosen_option_number".
                 The value should be the integer of the chosen option (e.g., 1, 2, or 3).
@@ -333,7 +342,7 @@ def process_email_request():
                     start_time_et = ET.localize(datetime.fromisoformat(event_data['start']))
                     duration = event_data['duration']
                     
-                    participants = [email.strip() for email in re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', original_from)]
+                    participants = [email.strip() for email in re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', original_from_header)]
                     attendees = [owner_email] + participants
 
                     create_calendar_event(calendar_service, owner_email, f"Meeting with {owner_name}", start_time_et, duration, attendees)
@@ -342,7 +351,7 @@ def process_email_request():
         
         # --- AI-powered Initial Request ---
         else:
-            preferences = get_email_intent_with_ai(snippet)
+            preferences = get_email_intent_with_ai(full_email_text) # Use full text
             available_slots = find_available_slots(calendar_service, owner_email, preferences)
             
             if available_slots:
@@ -355,7 +364,8 @@ def process_email_request():
                     hidden_data_for_body += f"<!-- data: {hidden_info} -->\n"
                 
                 genai.configure(api_key=GEMINI_API_KEY)
-                model = genai.GenerativeModel('gemini-pro')
+                # --- CORRECTED MODEL NAME ---
+                model = genai.GenerativeModel('gemini-1.5-flash-latest')
                 prompt = f"""
                 You are an AI assistant helping schedule a meeting for {owner_name}.
                 You have found the following available time slots:
