@@ -278,7 +278,7 @@ def process_email_request():
         headers = message['payload']['headers']
         subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
         
-        # --- CORRECTED: Use full body for AI context ---
+        # --- CORRECTED: Use full body for AI context and reply check ---
         full_email_text = ""
         if 'parts' in message['payload']:
             for part in message['payload']['parts']:
@@ -307,7 +307,8 @@ def process_email_request():
              return "Owner not in thread, request ignored.", 200
 
         # --- AI-powered Reply Parsing ---
-        if "Re:" in subject and "AI assistant" in snippet:
+        # --- CORRECTED: Use full_email_text instead of snippet ---
+        if "Re:" in subject and "AI assistant" in full_email_text:
             hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', str(message['payload']))
             
             if hidden_data_matches:
@@ -318,7 +319,6 @@ def process_email_request():
                     possible_slots_text += f"Option {i+1}: {start_time_et.strftime('%A, %B %d at %I:%M %p ET')} for {slot_data['duration']} minutes.\n"
                 
                 genai.configure(api_key=GEMINI_API_KEY)
-                # --- CORRECTED MODEL NAME ---
                 model = genai.GenerativeModel('gemini-1.5-flash-latest')
                 prompt = f"""
                 Read the user's reply to determine which option they chose for the meeting.
@@ -364,7 +364,6 @@ def process_email_request():
                     hidden_data_for_body += f"<!-- data: {hidden_info} -->\n"
                 
                 genai.configure(api_key=GEMINI_API_KEY)
-                # --- CORRECTED MODEL NAME ---
                 model = genai.GenerativeModel('gemini-1.5-flash-latest')
                 prompt = f"""
                 You are an AI assistant helping schedule a meeting for {owner_name}.
