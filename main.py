@@ -67,8 +67,7 @@ def get_conversation_intent_with_ai(email_thread_text, current_date_et, api_key)
 
     try:
         genai.configure(api_key=api_key)
-        # --- FIX: Use the correct, current model ---
-        model = genai.GenerativeModel('gemini-2.5-flash') 
+        model = genai.GenerativeModel('gemini-1.5-pro-latest') 
         
         prompt = f"""
         Analyze the following email thread to determine the user's current intent. The current date is {current_date_et.strftime('%Y-%m-%d')}.
@@ -346,12 +345,19 @@ def process_email_request():
             confirmed_start_time_iso = intent_data.get('confirmed_start_time_iso') if intent_data else None
 
             if confirmed_start_time_iso:
+                print(f"AI returned confirmed time: {confirmed_start_time_iso}")
                 hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', full_email_text)
-                duration = 60 # default
+                duration = 60 
                 found_match = False
+                
+                # --- FIX: Normalize ISO strings before comparing ---
+                norm_confirmed_time = datetime.fromisoformat(confirmed_start_time_iso).astimezone(pytz.utc).isoformat()
+
                 for hidden_info_str in hidden_data_matches:
                     event_data = json.loads(hidden_info_str)
-                    if event_data['start'] == confirmed_start_time_iso:
+                    norm_event_time = datetime.fromisoformat(event_data['start']).astimezone(pytz.utc).isoformat()
+                    
+                    if norm_event_time == norm_confirmed_time:
                         duration = event_data['duration']
                         found_match = True
                         break
@@ -367,7 +373,7 @@ def process_email_request():
                     create_calendar_event(calendar_service, owner_email, f"Meeting: {subject.replace('Re: ', '')}", start_time_et, duration, attendees)
                     print(f"Event scheduled with {', '.join(attendees)}")
                 else:
-                    print("AI confirmed a time, but it wasn't one of the options. Ignoring.")
+                    print(f"AI confirmed a time ({confirmed_start_time_iso}), but it was not one of the options offered. Ignoring.")
 
         elif intent == "INITIAL_REQUEST" or intent == "OTHER":
             print(f"AI detected {intent} intent. Finding slots.")
@@ -387,7 +393,7 @@ def process_email_request():
                 recipient_name = sender_name_match.group(1).strip() if sender_name_match else "there"
 
                 genai.configure(api_key=gemini_api_key)
-                model = genai.GenerativeModel('gemini-1.5-flash-latest')
+                model = genai.GenerativeModel('gemini-1.5-pro-latest')
                 prompt = f"""
                 You are a helpful AI assistant for {owner_name}.
                 Write a brief, friendly, and natural-sounding email to {recipient_name} to propose meeting times.
