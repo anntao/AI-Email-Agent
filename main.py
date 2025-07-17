@@ -67,7 +67,7 @@ def get_conversation_intent_with_ai(email_thread_text, current_date_et, api_key)
 
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.5-flash') 
+        model = genai.GenerativeModel('gemini-1.5-pro-latest') 
         
         prompt = f"""
         Analyze the following email thread to determine the user's current intent. The current date is {current_date_et.strftime('%Y-%m-%d')}.
@@ -350,14 +350,14 @@ def process_email_request():
                 duration = 60 
                 found_match = False
                 
-                # --- FIX: Normalize ISO strings before comparing ---
-                norm_confirmed_time = datetime.fromisoformat(confirmed_start_time_iso).astimezone(pytz.utc).isoformat()
+                # --- FIX: Normalize datetimes by rounding to the minute before comparing ---
+                confirmed_dt_rounded = datetime.fromisoformat(confirmed_start_time_iso).replace(second=0, microsecond=0)
 
                 for hidden_info_str in hidden_data_matches:
                     event_data = json.loads(hidden_info_str)
-                    norm_event_time = datetime.fromisoformat(event_data['start']).astimezone(pytz.utc).isoformat()
+                    event_dt_rounded = datetime.fromisoformat(event_data['start']).replace(second=0, microsecond=0)
                     
-                    if norm_event_time == norm_confirmed_time:
+                    if event_dt_rounded == confirmed_dt_rounded:
                         duration = event_data['duration']
                         found_match = True
                         break
@@ -393,7 +393,7 @@ def process_email_request():
                 recipient_name = sender_name_match.group(1).strip() if sender_name_match else "there"
 
                 genai.configure(api_key=gemini_api_key)
-                model = genai.GenerativeModel('gemini-2.5-flash')
+                model = genai.GenerativeModel('gemini-1.5-pro-latest')
                 prompt = f"""
                 You are a helpful AI assistant for {owner_name}.
                 Write a brief, friendly, and natural-sounding email to {recipient_name} to propose meeting times.
