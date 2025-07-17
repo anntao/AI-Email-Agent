@@ -267,21 +267,13 @@ def process_email_request():
     if not envelope or 'message' not in envelope:
         print('Invalid Pub/Sub message format. This may be a health check.')
         return 'OK', 200
-        
-    # --- FIX: Deduplication logic using message ID from Pub/Sub payload ---
+    
     try:
         data = json.loads(base64.b64decode(envelope['message']['data']).decode('utf-8'))
-        # This is the unique ID for the history event, not the message itself yet
-        # We'll use this as a proxy for the message ID for deduplication
-        event_id = envelope['message']['messageId'] 
-        if event_id in PROCESSED_MESSAGE_IDS:
-            print(f"Duplicate Pub/Sub message received: {event_id}. Ignoring.")
-            return "Duplicate message", 200
-        PROCESSED_MESSAGE_IDS.append(event_id)
+        history_id = data['historyId']
     except Exception as e:
         print(f"Could not decode Pub/Sub message: {e}")
         return "Bad Request", 400
-
 
     # Wait for API to sync
     sleep_timer.sleep(5)
@@ -302,8 +294,7 @@ def process_email_request():
         return "Service build failed.", 500
 
     try:
-        # Use historyId from Pub/Sub to get the specific new message
-        history_id = data['historyId']
+        # --- FIX: Deduplication using Message ID ---
         history = gmail_service.users().history().list(userId='me', startHistoryId=history_id).execute()
         
         messages_added = []
@@ -315,10 +306,16 @@ def process_email_request():
             print("No message was added in this history event.")
             return "No message added.", 200
 
-        # Process the first new message found
         msg_id = messages_added[0]['message']['id']
+        
+        # Check for duplicates
+        if msg_id in PROCESSED_MESSAGE_IDS:
+            print(f"Duplicate message ID detected: {msg_id}. Ignoring.")
+            return "Duplicate message", 200
+        PROCESSED_MESSAGE_IDS.append(msg_id)
+        print(f"Stored new message ID: {msg_id}")
 
-        # Mark as read to be safe, though deduplication is primary
+        # Mark as read to be safe
         gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
         
         message = gmail_service.users().messages().get(userId='me', id=msg_id, format='full').execute()
@@ -342,7 +339,8 @@ def process_email_request():
 
         hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', full_email_text)
 
-        is_reply_to_agent = "AI assistant" in full_email_text and hidden_data_matches
+        # --- FIX: Logic to handle replies ---
+        is_reply_to_agent = "AI assistant" in full_email_text and hidden_data_matches and owner_email not in original_from_header
 
         if is_reply_to_agent:
             print("Detected reply to agent. Attempting to schedule event.")
@@ -383,7 +381,7 @@ def process_email_request():
                 create_calendar_event(calendar_service, owner_email, f"Meeting: {subject.replace('Re: ', '')}", start_time_et, duration, attendees)
                 print(f"Event scheduled with {', '.join(attendees)}")
         
-        else:
+        else: # This is an initial request
             print("Detected initial request. Finding slots.")
             preferences = get_email_intent_with_ai(full_email_text, datetime.now(ET))
             available_slots = find_available_slots(calendar_service, owner_email, preferences)
