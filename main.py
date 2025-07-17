@@ -16,6 +16,7 @@ from googleapiclient.discovery import build
 from google.cloud import secretmanager
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+import time as sleep_timer # Renamed to avoid conflict with time object
 
 # --- Flask App Initialization ---
 app = Flask(__name__)
@@ -143,7 +144,7 @@ def find_available_slots(service, calendar_id, preferences):
     
     weekday_map = {
         'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3,
-        'friday': 4, 'saturday': 5, 'sunday': 6
+        'friday': 4
     }
     target_weekday = weekday_map.get(day_preference.lower()) if day_preference else None
 
@@ -240,6 +241,9 @@ def create_calendar_event(service, calendar_id, summary, start_time_et, duration
 @app.route('/', methods=['POST'])
 def process_email_request():
     """Entry point for all requests, triggered by Pub/Sub."""
+    # Add a delay to handle potential API lag
+    sleep_timer.sleep(5)
+    
     envelope = request.get_json()
     if not envelope or 'message' not in envelope:
         print('Invalid Pub/Sub message format. This may be a health check.')
@@ -261,7 +265,7 @@ def process_email_request():
         return "Service build failed.", 500
 
     try:
-        # Search for the newest unread message.
+        # Search for the newest unread message. This is more robust than using historyId.
         list_response = gmail_service.users().messages().list(userId='me', q='is:unread', maxResults=1).execute()
         if not list_response.get('messages'):
             print("No new unread messages found.")
@@ -274,17 +278,17 @@ def process_email_request():
         subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
         snippet = message.get('snippet', '')
         
-        # --- NEW: Get Message-ID and References for proper threading ---
         message_id_header = next((h['value'] for h in headers if h['name'].lower() == 'message-id'), None)
         references_header = next((h['value'] for h in headers if h['name'].lower() == 'references'), '')
-
-        # Construct the new references header
         new_references = f"{references_header} {message_id_header}".strip()
 
+        # --- CORRECTED OWNER CHECK ---
         original_to = next((h['value'] for h in headers if h['name'].lower() == 'to'), '')
         original_cc = next((h['value'] for h in headers if h['name'].lower() == 'cc'), '')
-        if owner_email not in (original_to + original_cc):
-             print(f"Owner ({owner_email}) not in recipients. Ignoring email.")
+        original_from = next((h['value'] for h in headers if h['name'].lower() == 'from'), '')
+        
+        if owner_email not in (original_to + original_cc + original_from):
+             print(f"Owner ({owner_email}) not in participants (To, From, Cc). Ignoring email.")
              gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
              return "Owner not in thread, request ignored.", 200
 
@@ -329,7 +333,6 @@ def process_email_request():
                     start_time_et = ET.localize(datetime.fromisoformat(event_data['start']))
                     duration = event_data['duration']
                     
-                    original_from = next((h['value'] for h in headers if h['name'].lower() == 'from'), '')
                     participants = [email.strip() for email in re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', original_from)]
                     attendees = [owner_email] + participants
 
@@ -372,14 +375,13 @@ def process_email_request():
                 </body></html>
                 """
 
-                # --- NEW: Clean subject for replies ---
                 clean_subject = f"Re: {subject.replace('Re: ', '')}"
                 
                 all_emails = set(re.findall(r'<([^>]+)>', original_to + original_cc))
                 all_emails.update(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', original_to + original_cc))
                 participants = [email for email in all_emails if email not in [agent_email, owner_email]]
                 to_field = ", ".join(participants)
-                cc_field = owner_email
+                cc_field = owner_email # <-- Always CC the owner
                 
                 email_message = create_threaded_email(agent_email, to_field, cc_field, clean_subject, html_body, in_reply_to=message_id_header, references=new_references)
                 send_email(gmail_service, 'me', email_message)
