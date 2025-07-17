@@ -67,6 +67,7 @@ def get_conversation_intent_with_ai(email_thread_text, current_date_et, api_key)
 
     try:
         genai.configure(api_key=api_key)
+        # --- FIX: Use the correct, current model ---
         model = genai.GenerativeModel('gemini-2.5-flash') 
         
         prompt = f"""
@@ -102,7 +103,7 @@ def get_conversation_intent_with_ai(email_thread_text, current_date_et, api_key)
 
 def find_available_slots(service, calendar_id, preferences):
     """Finds available slots based on AI-parsed preferences, skipping weekends."""
-    duration_minutes = preferences.get('duration', 60)
+    duration_minutes = preferences.get('duration') or 60
     day_preference = preferences.get('day_preference')
     time_of_day = preferences.get('time_of_day')
     start_date_str = preferences.get('start_date')
@@ -386,7 +387,7 @@ def process_email_request():
                 recipient_name = sender_name_match.group(1).strip() if sender_name_match else "there"
 
                 genai.configure(api_key=gemini_api_key)
-                model = genai.GenerativeModel('gemini-2.5-flash')
+                model = genai.GenerativeModel('gemini-1.5-flash-latest')
                 prompt = f"""
                 You are a helpful AI assistant for {owner_name}.
                 Write a brief, friendly, and natural-sounding email to {recipient_name} to propose meeting times.
