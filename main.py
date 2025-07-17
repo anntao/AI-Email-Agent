@@ -95,7 +95,6 @@ def get_email_intent_with_ai(email_thread_text):
         
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        # --- CORRECTED MODEL NAME ---
         model = genai.GenerativeModel('gemini-1.5-flash-latest')
         prompt = f"""
         Analyze the following email thread to determine scheduling preferences.
@@ -239,16 +238,32 @@ def create_calendar_event(service, calendar_id, summary, start_time_et, duration
     created_event = service.events().insert(calendarId=calendar_id, body=event, sendNotifications=True).execute()
     print(f'Event created: {created_event.get("htmlLink")}')
 
+def get_full_email_text(payload):
+    """Recursively extracts all plain text from an email payload."""
+    body = ""
+    if payload.get('body') and payload['body'].get('data'):
+        data = payload['body']['data']
+        body += base64.urlsafe_b64decode(data).decode('utf-8')
+    
+    if 'parts' in payload:
+        for part in payload['parts']:
+            if part['mimeType'] == 'text/plain':
+                if part.get('body') and part['body'].get('data'):
+                    data = part['body']['data']
+                    body += base64.urlsafe_b64decode(data).decode('utf-8')
+            elif 'parts' in part:
+                 body += get_full_email_text(part) # Recursive call
+    return body
+
 @app.route('/', methods=['POST'])
 def process_email_request():
     """Entry point for all requests, triggered by Pub/Sub."""
-    # Add a delay to handle potential API lag
     sleep_timer.sleep(5)
     
     envelope = request.get_json()
     if not envelope or 'message' not in envelope:
         print('Invalid Pub/Sub message format. This may be a health check.')
-        return 'OK', 200 # Return 200 for health checks
+        return 'OK', 200
     
     agent_email = 'anntaoai@gmail.com'
     owner_email = 'anntaod@gmail.com'
@@ -266,7 +281,6 @@ def process_email_request():
         return "Service build failed.", 500
 
     try:
-        # Search for the newest unread message. This is more robust than using historyId.
         list_response = gmail_service.users().messages().list(userId='me', q='is:unread', maxResults=1).execute()
         if not list_response.get('messages'):
             print("No new unread messages found.")
@@ -278,80 +292,66 @@ def process_email_request():
         headers = message['payload']['headers']
         subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
         
-        # --- CORRECTED: Use full body for AI context and reply check ---
-        full_email_text = ""
-        if 'parts' in message['payload']:
-            for part in message['payload']['parts']:
-                if part['mimeType'] == 'text/plain':
-                    body_data = part['body'].get('data')
-                    if body_data:
-                        full_email_text += base64.urlsafe_b64decode(body_data).decode('utf-8')
-        else:
-             body_data = message['payload']['body'].get('data')
-             if body_data:
-                full_email_text = base64.urlsafe_b64decode(body_data).decode('utf-8')
-
-
+        # CORRECTLY get the full email text first
+        full_email_text = get_full_email_text(message['payload'])
+        
         message_id_header = next((h['value'] for h in headers if h['name'].lower() == 'message-id'), None)
         references_header = next((h['value'] for h in headers if h['name'].lower() == 'references'), '')
         new_references = f"{references_header} {message_id_header}".strip()
 
-        # --- CORRECTED OWNER CHECK ---
         original_to = next((h['value'] for h in headers if h['name'].lower() == 'to'), '')
         original_cc = next((h['value'] for h in headers if h['name'].lower() == 'cc'), '')
         original_from_header = next((h['value'] for h in headers if h['name'].lower() == 'from'), '')
         
         if owner_email not in (original_to + original_cc + original_from_header):
-             print(f"Owner ({owner_email}) not in participants (To, From, Cc). Ignoring email.")
+             print(f"Owner ({owner_email}) not in participants. Ignoring email.")
              gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
              return "Owner not in thread, request ignored.", 200
 
-        # --- AI-powered Reply Parsing ---
-        # --- CORRECTED: Use full_email_text instead of snippet ---
-        if "Re:" in subject and "AI assistant" in full_email_text:
-            hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', str(message['payload']))
+        # Check for our hidden data to see if this is a reply to the agent
+        hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', full_email_text)
+
+        if hidden_data_matches:
+            # This is a reply to the agent's suggestion
+            possible_slots_text = ""
+            for i, hidden_info_str in enumerate(hidden_data_matches):
+                slot_data = json.loads(hidden_info_str)
+                start_time_et = ET.localize(datetime.fromisoformat(slot_data['start']))
+                possible_slots_text += f"Option {i+1}: {start_time_et.strftime('%A, %B %d at %I:%M %p ET')} for {slot_data['duration']} minutes.\n"
             
-            if hidden_data_matches:
-                possible_slots_text = ""
-                for i, hidden_info_str in enumerate(hidden_data_matches):
-                    slot_data = json.loads(hidden_info_str)
-                    start_time_et = ET.localize(datetime.fromisoformat(slot_data['start']))
-                    possible_slots_text += f"Option {i+1}: {start_time_et.strftime('%A, %B %d at %I:%M %p ET')} for {slot_data['duration']} minutes.\n"
+            genai.configure(api_key=GEMINI_API_KEY)
+            model = genai.GenerativeModel('gemini-1.5-flash-latest')
+            prompt = f"""
+            Read the user's reply to determine which option they chose for the meeting.
+            The options offered were:
+            {possible_slots_text}
+            The user's reply is: "{full_email_text}"
+            Respond with a JSON object containing one key: "chosen_option_number".
+            The value should be the integer of the chosen option (e.g., 1, 2, or 3).
+            If the user did not clearly choose an option, respond with null.
+            JSON:
+            """
+            response = model.generate_content(prompt)
+            json_str = response.text.strip().replace('```json', '').replace('```', '').strip()
+            choice_data = json.loads(json_str)
+            chosen_option = choice_data.get('chosen_option_number')
+
+            if chosen_option and len(hidden_data_matches) >= chosen_option:
+                event_data = json.loads(hidden_data_matches[chosen_option - 1])
+                start_time_et = ET.localize(datetime.fromisoformat(event_data['start']))
+                duration = event_data['duration']
                 
-                genai.configure(api_key=GEMINI_API_KEY)
-                model = genai.GenerativeModel('gemini-1.5-flash-latest')
-                prompt = f"""
-                Read the user's reply to determine which option they chose for the meeting.
-                The options offered were:
-                {possible_slots_text}
+                # The person who replied is the one in the "From" header
+                participants = [email.strip() for email in re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', original_from_header)]
+                attendees = [owner_email] + participants
 
-                The user's reply is: "{full_email_text}"
-
-                Respond with a JSON object containing one key: "chosen_option_number".
-                The value should be the integer of the chosen option (e.g., 1, 2, or 3).
-                If the user did not clearly choose an option, respond with null.
-                JSON:
-                """
-                response = model.generate_content(prompt)
-                json_str = response.text.strip().replace('```json', '').replace('```', '').strip()
-                choice_data = json.loads(json_str)
-                chosen_option = choice_data.get('chosen_option_number')
-
-                if chosen_option and len(hidden_data_matches) >= chosen_option:
-                    event_data = json.loads(hidden_data_matches[chosen_option - 1])
-                    start_time_et = ET.localize(datetime.fromisoformat(event_data['start']))
-                    duration = event_data['duration']
-                    
-                    participants = [email.strip() for email in re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', original_from_header)]
-                    attendees = [owner_email] + participants
-
-                    create_calendar_event(calendar_service, owner_email, f"Meeting with {owner_name}", start_time_et, duration, attendees)
-                    gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
-                    print(f"Event scheduled with {', '.join(participants)}")
+                create_calendar_event(calendar_service, owner_email, f"Meeting with {owner_name}", start_time_et, duration, attendees)
+                gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
+                print(f"Event scheduled with {', '.join(participants)}")
         
-        # --- AI-powered Initial Request ---
         else:
-            preferences = get_email_intent_with_ai(full_email_text) # Use full text
+            # This is an initial request
+            preferences = get_email_intent_with_ai(full_email_text)
             available_slots = find_available_slots(calendar_service, owner_email, preferences)
             
             if available_slots:
@@ -363,16 +363,22 @@ def process_email_request():
                     hidden_info = json.dumps({'start': slot_et.isoformat(), 'duration': slot_data['duration']})
                     hidden_data_for_body += f"<!-- data: {hidden_info} -->\n"
                 
+                # Get the name of the original sender for a personal touch
+                sender_name = re.match(r'"?(.*?)"?\s*<', original_from_header)
+                recipient_name = sender_name.group(1) if sender_name else "there"
+
                 genai.configure(api_key=GEMINI_API_KEY)
                 model = genai.GenerativeModel('gemini-1.5-flash-latest')
                 prompt = f"""
-                You are an AI assistant helping schedule a meeting for {owner_name}.
-                You have found the following available time slots:
+                You are a helpful AI assistant for {owner_name}.
+                Write a brief, friendly, and natural-sounding email to {recipient_name} to propose meeting times.
+                
+                The available time slots are:
                 {slots_text}
 
-                Write a brief, friendly, and natural-sounding email to propose these times.
-                Do NOT ask the user to "choose an option". Instead, phrase it conversationally, like "Let me know if any of these times work for you."
-                Keep it concise and professional.
+                Your response should be conversational (e.g., "Hi {recipient_name}, I'm helping {owner_name} coordinate a meeting... Here are a few times that work:").
+                Do NOT include a subject line in your response.
+                End by saying something like, "Let me know if any of these work for you!"
                 """
                 email_response = model.generate_content(prompt)
                 email_body_text = email_response.text
@@ -390,7 +396,7 @@ def process_email_request():
                 all_emails.update(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', original_to + original_cc))
                 participants = [email for email in all_emails if email not in [agent_email, owner_email]]
                 to_field = ", ".join(participants)
-                cc_field = owner_email # <-- Always CC the owner
+                cc_field = owner_email
                 
                 email_message = create_threaded_email(agent_email, to_field, cc_field, clean_subject, html_body, in_reply_to=message_id_header, references=new_references)
                 send_email(gmail_service, 'me', email_message)
@@ -407,6 +413,5 @@ def process_email_request():
 
 # This block is essential for the server to start.
 if __name__ == "__main__":
-    # Use the PORT environment variable provided by Cloud Run
     port = int(os.environ.get("PORT", 8080))
     app.run(debug=True, host='0.0.0.0', port=port)
