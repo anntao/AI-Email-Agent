@@ -19,6 +19,7 @@ from google.cloud import firestore
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import time as sleep_timer
+import random
 
 # --- Flask App Initialization ---
 app = Flask(__name__)
@@ -543,10 +544,9 @@ def process_email_request():
                     
                     # Schedule the meeting
                     all_emails_str = original_to + "," + original_cc + "," + original_from_header
-                    attendees = list(set(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', all_emails_str)))
+                    attendees = [email for email in set(re.findall(r'[\w\.+-]+@[\w\.-]+\\.[\w\.-]+', all_emails_str)) if email != agent_email]
                     if owner_email not in attendees:
                         attendees.append(owner_email)
-                    attendees = [email for email in attendees if email != agent_email]
 
                     create_calendar_event(calendar_service, owner_email, f"Meeting: {subject.replace('Re: ', '')}", 
                                        selected_slot['datetime'], selected_slot['duration'], attendees)
@@ -556,12 +556,50 @@ def process_email_request():
             else:
                 print("AI detected DAY_CONFIRMATION but no day_name provided")
 
-        elif intent == "INITIAL_REQUEST" or intent == "OTHER":
-            print(f"AI detected {intent} intent. Finding slots.")
-            preferences = intent_data if intent == "INITIAL_REQUEST" else {'duration': 60}
+        # --- IMPROVEMENT: Handle 'none of these work' replies ---
+        elif intent == "OTHER":
+            print("AI detected OTHER intent. Checking for new preferences.")
+            # Try to extract new preferences from the AI (reuse INITIAL_REQUEST logic)
+            preferences = {'duration': 60}
+            # Ask Gemini to extract new preferences if present
+            try:
+                genai.configure(api_key=gemini_api_key)
+                model = genai.GenerativeModel('gemini-2.5-flash')
+                pref_prompt = f"""
+                The user replied that none of the offered times work. Please extract any new preferences for meeting time (such as preferred days, times, or durations) from the following email. If no new preferences are found, return an empty object.
+                Email:
+                '''
+                {current_message_text}
+                '''
+                Respond with a JSON object with possible keys: duration, day_preference, time_of_day, start_date.
+                """
+                pref_response = model.generate_content(pref_prompt)
+                print(f"AI preference extraction response: {pref_response.text}")
+                pref_json = pref_response.text.strip().replace('```json', '').replace('```', '').strip()
+                new_prefs = json.loads(pref_json)
+                if new_prefs:
+                    preferences.update(new_prefs)
+            except Exception as e:
+                print(f"Could not extract new preferences: {e}")
             available_slots = find_available_slots(calendar_service, owner_email, preferences)
-            
+            # (The rest of the slot suggestion logic is unchanged and will use the new preferences if found)
+
             if available_slots:
+                # --- IMPROVEMENT 2: Ensure time slot variety ---
+                # Try to get at least one morning and one afternoon slot
+                morning_slots = [s for s in available_slots if s['slot'].hour < 12]
+                afternoon_slots = [s for s in available_slots if s['slot'].hour >= 12]
+                diverse_slots = []
+                if morning_slots:
+                    diverse_slots.append(morning_slots[0])
+                if afternoon_slots:
+                    diverse_slots.append(afternoon_slots[0])
+                # Fill up to 3 with remaining unique slots
+                for s in available_slots:
+                    if s not in diverse_slots and len(diverse_slots) < 3:
+                        diverse_slots.append(s)
+                available_slots = diverse_slots
+
                 slots_text = ""
                 hidden_data_for_body = ""
                 for i, slot_data in enumerate(available_slots):
@@ -569,24 +607,53 @@ def process_email_request():
                     slots_text += f"- {slot_et.strftime('%A, %B %d at %I:%M %p ET')}\n"
                     hidden_info = json.dumps({'start': slot_et.isoformat(), 'duration': slot_data['duration']})
                     hidden_data_for_body += f"<!-- data: {hidden_info} -->\n"
-                    # Also add as invisible text for better preservation
                     hidden_data_for_body += f'<span style="display:none;">SLOT_DATA:{hidden_info}</span>\n'
-                
-                sender_name_match = re.search(r'"?([^<"]+)"?\s*<', original_from_header)
-                recipient_name = sender_name_match.group(1).strip() if sender_name_match else "there"
+
+                # --- IMPROVEMENT 1: Greeting only non-owner, non-agent recipients ---
+                all_emails_str = original_to + "," + original_cc + "," + original_from_header
+                all_emails = list(set(re.findall(r'[\w\.+-]+@[\w\.-]+\\.[\w\.-]+', all_emails_str)))
+                participants = [email for email in all_emails if email not in [agent_email, owner_email]]
+                to_field = ", ".join(participants)
+                cc_field = owner_email
+
+                # If no participants (i.e., only agent is in To), CC owner (IMPROVEMENT 3)
+                if not participants:
+                    cc_field = owner_email
+
+                # For greeting, use names or emails of participants
+                recipient_names = []
+                for email in participants:
+                    # Try to extract name from headers
+                    name_match = re.search(rf'([\w\s\"\']+)\s*<\s*{re.escape(email)}\s*>', original_to + "," + original_cc + "," + original_from_header, re.IGNORECASE)
+                    if name_match:
+                        name = name_match.group(1).replace('"', '').replace("'", '').strip()
+                        recipient_names.append(name)
+                    else:
+                        recipient_names.append(email)
+                greeting_name = ", ".join(recipient_names) if recipient_names else "there"
+
+                # --- IMPROVEMENT: Greeting variety ---
+                greeting_templates = [
+                    "Hi {name}, I'm helping {owner} coordinate a meeting. Here are a few times that work:",
+                    "Hello {name}, {owner} asked me to help schedule a meeting. Would any of these times work for you?",
+                    "Hey {name}, I'm assisting {owner} with scheduling. Please let me know if any of these times are good:",
+                    "Greetings {name}, I'm reaching out on behalf of {owner} to propose some meeting times:",
+                    "Hi {name}, here are some options from {owner}'s calendar. Let me know what works!"
+                ]
+                greeting_template = random.choice(greeting_templates)
+                greeting_line = greeting_template.format(name=greeting_name, owner=owner_name)
 
                 genai.configure(api_key=gemini_api_key)
                 model = genai.GenerativeModel('gemini-2.5-flash')
                 prompt = f"""
                 You are a helpful AI assistant for {owner_name}.
-                Write a brief, friendly, and natural-sounding email to {recipient_name} to propose meeting times.
-                
+                Write a brief, friendly, and natural-sounding email to {greeting_name} to propose meeting times.
+                Start the email with this line: '{greeting_line}'
                 The available time slots are:
                 {slots_text}
-
-                Your response should be conversational (e.g., "Hi {recipient_name}, I'm helping {owner_name} coordinate a meeting... Here are a few times that work:").
+                Your response should be conversational and not robotic.
                 Do NOT include a subject line in your response.
-                End by saying something like, "Let me know if any of these work for you!"
+                End by saying something like, \"Let me know if any of these work for you!\"
                 """
                 email_response = model.generate_content(prompt)
                 email_body_text = email_response.text
@@ -595,19 +662,13 @@ def process_email_request():
                 <html><body>
                 <p>{email_body_text.replace(os.linesep, '<br>')}</p>
                 {hidden_data_for_body}
+                <hr style='border:1px solid #0074D9; margin-top:24px; margin-bottom:8px;'>
+                <div style='color:#0074D9; font-weight:bold; font-family:sans-serif;'>Anntao's AI Agent</div>
                 </body></html>
                 """
 
                 clean_subject = f"Re: {subject.replace('Re: ', '')}"
-                
-                all_emails_str = original_to + "," + original_cc + "," + original_from_header
-                all_emails = list(set(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', all_emails_str)))
-                
-                participants = [email for email in all_emails if email not in [agent_email, owner_email]]
-                
-                to_field = ", ".join(participants)
-                cc_field = owner_email
-                
+
                 email_message = create_threaded_email(agent_email, to_field, cc_field, clean_subject, html_body, in_reply_to=message_id_header, references=new_references)
                 send_email(gmail_service, 'me', email_message)
                 print(f"Sent time slot suggestions to {to_field}")
