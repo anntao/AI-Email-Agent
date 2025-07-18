@@ -296,14 +296,19 @@ def process_email_request():
         history_id = str(data['historyId'])
         doc_ref = db.collection('processed_history').document(history_id)
 
-        # --- MOVE: Deduplication check to very start ---
-        snapshot = doc_ref.get()
-        if snapshot.exists:
-            print(f"Duplicate historyId detected: {history_id}. Ignoring.")
-            return "Duplicate message", 200
+        # --- PATCH: Use Firestore transaction for atomic deduplication ---
+        def dedup_transaction(transaction, doc_ref):
+            snapshot = doc_ref.get(transaction=transaction)
+            if snapshot.exists:
+                print(f"Duplicate historyId detected (transaction): {history_id}. Ignoring.")
+                return False
+            transaction.set(doc_ref, {'timestamp': firestore.SERVER_TIMESTAMP})
+            return True
 
-        # --- PATCH: Write deduplication record immediately to prevent double replies ---
-        doc_ref.set({'timestamp': firestore.SERVER_TIMESTAMP})
+        transaction = db.transaction()
+        dedup_result = dedup_transaction(transaction, doc_ref)
+        if not dedup_result:
+            return "Duplicate message", 200
 
     except Exception as e:
         print(f"Firestore deduplication check failed: {e}")
