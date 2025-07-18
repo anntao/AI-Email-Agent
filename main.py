@@ -220,9 +220,7 @@ def send_email(service, user_id, message, thread_id=None):
   try:
     if thread_id:
       message['threadId'] = thread_id
-      sent = (service.users().messages().send(userId=user_id, body=message, threadId=thread_id).execute())
-    else:
-      sent = (service.users().messages().send(userId=user_id, body=message).execute())
+    sent = (service.users().messages().send(userId=user_id, body=message).execute())
     return sent
   except Exception as e:
     print(f'An error occurred while sending email: {e}')
