@@ -300,6 +300,9 @@ def process_email_request():
             print(f"Duplicate historyId detected: {history_id}. Ignoring.")
             return "Duplicate message", 200
 
+        # --- PATCH: Write deduplication record immediately to prevent double replies ---
+        doc_ref.set({'timestamp': firestore.SERVER_TIMESTAMP})
+
     except Exception as e:
         print(f"Firestore deduplication check failed: {e}")
         return "Internal Server Error", 500
@@ -471,7 +474,6 @@ def process_email_request():
                 email_message = create_threaded_email(agent_email, to_field, cc_field, clean_subject, html_body, in_reply_to=message_id_header, references=new_references)
                 send_email(gmail_service, 'me', email_message)
                 print(f"[DEBUG] INITIAL_REQUEST: Sent time slot suggestions to {to_field}")
-                doc_ref.set({'timestamp': firestore.SERVER_TIMESTAMP})
                 gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
                 print(f"[DEBUG] INITIAL_REQUEST: Marked message {msg_id} as read and set historyId {history_id}")
             except Exception as e:
