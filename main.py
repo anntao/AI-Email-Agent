@@ -20,6 +20,8 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import time as sleep_timer
 import random
+import re
+from dateutil import parser as dtparser
 
 # --- Flask App Initialization ---
 app = Flask(__name__)
@@ -385,6 +387,10 @@ def process_email_request():
         original_to = next((h['value'] for h in headers if h['name'].lower() == 'to'), '')
         original_cc = next((h['value'] for h in headers if h['name'].lower() == 'cc'), '')
         original_from_header = next((h['value'] for h in headers if h['name'].lower() == 'from'), '')
+        owner_email = owner_email or ""
+        original_to = original_to or ""
+        original_cc = original_cc or ""
+        original_from_header = original_from_header or ""
         print(f"owner_email: {owner_email}")
         print(f"original_to: {original_to}")
         print(f"original_cc: {original_cc}")
@@ -435,7 +441,6 @@ def process_email_request():
 
                 # --- PATCH: Extract recipient first name from signature if present ---
                 # Try to find a signature block in the current message
-                import re
                 signature_match = re.search(r'-- ?\\n([A-Za-z]+)', current_message_text)
                 if signature_match:
                     greeting_name = signature_match.group(1)
@@ -443,7 +448,13 @@ def process_email_request():
                     # Fallback to previous logic (extract from email headers)
                     recipient_names = []
                     for email in participants:
-                        name_match = re.search(rf'([\\w\\s\\"\\']+)\\s*<\\s*{re.escape(email)}\\s*>', original_to + "," + original_cc + "," + original_from_header, re.IGNORECASE)
+                        try:
+                            # Use a robust regex for name extraction, ensure all parentheses are closed
+                            pattern = r'([\w\s\"\']+)\s*<\s*' + re.escape(email) + r'\s*>'
+                            name_match = re.search(pattern, original_to + "," + original_cc + "," + original_from_header, re.IGNORECASE)
+                        except Exception as e:
+                            print(f"Regex error in recipient name extraction: {e}")
+                            name_match = None
                         if name_match:
                             name = name_match.group(1).replace('"', '').replace("'", '').strip()
                             recipient_names.append(name)
@@ -505,7 +516,9 @@ def process_email_request():
 
         elif intent == "CONFIRMATION":
             print("AI detected CONFIRMATION intent.")
-            confirmed_start_time_iso = intent_data.get('confirmed_start_time_iso') if intent_data else None
+            confirmed_start_time_iso = None
+            if intent_data and isinstance(intent_data, dict):
+                confirmed_start_time_iso = intent_data.get('confirmed_start_time_iso')
 
             if confirmed_start_time_iso:
                 print(f"AI returned confirmed time: {confirmed_start_time_iso}")
@@ -593,8 +606,11 @@ def process_email_request():
 
         elif intent == "DAY_CONFIRMATION":
             print("AI detected DAY_CONFIRMATION intent.")
-            day_name = intent_data.get('day_name') if intent_data else None
-            time_of_day = intent_data.get('time_of_day') if intent_data else None
+            day_name = None
+            time_of_day = None
+            if intent_data and isinstance(intent_data, dict):
+                day_name = intent_data.get('day_name')
+                time_of_day = intent_data.get('time_of_day')
 
             if day_name:
                 print(f"User confirmed day: {day_name}, time preference: {time_of_day}")
@@ -675,17 +691,17 @@ def process_email_request():
             print("AI detected OTHER intent. Checking for new preferences.")
             # Try to extract new preferences from the AI (reuse INITIAL_REQUEST logic)
             preferences = {'duration': 60}
-            # Ask Gemini to extract new preferences if present
+            # Ask Gemini to extract new preferences if present, including time and time zone
             try:
                 genai.configure(api_key=gemini_api_key)
                 model = genai.GenerativeModel('gemini-2.5-flash')
                 pref_prompt = f"""
-                The user replied that none of the offered times work. Please extract any new preferences for meeting time (such as preferred days, times, or durations) from the following email. If no new preferences are found, return an empty object.
+                The user replied that none of the offered times work, or is proposing a new time. Please extract any new preferences for meeting time (such as preferred days, times, durations, or specific times) from the following email. If the user mentions a specific time (e.g., '4pm Paris'), extract both the time and the time zone/city if present. If no new preferences are found, return an empty object.
                 Email:
                 '''
                 {current_message_text}
                 '''
-                Respond with a JSON object with possible keys: duration, day_preference, time_of_day, start_date.
+                Respond with a JSON object with possible keys: duration, day_preference, time_of_day, start_date, specific_time (ISO 8601), time_zone (IANA tz name or city).
                 """
                 pref_response = model.generate_content(pref_prompt)
                 print(f"AI preference extraction response: {pref_response.text}")
@@ -696,7 +712,43 @@ def process_email_request():
             except Exception as e:
                 print(f"Could not extract new preferences: {e}")
             print(f"Preferences for slot search: {preferences}")
-            available_slots = find_available_slots(calendar_service, owner_email, preferences)
+
+            # --- PATCH: Handle specific_time and time_zone conversion ---
+            user_time_et = None
+            if preferences.get('specific_time'):
+                user_time_str = preferences['specific_time']
+                if not isinstance(user_time_str, str):
+                    user_time_str = str(user_time_str)
+                user_tz = preferences.get('time_zone', 'America/New_York')
+                if not isinstance(user_tz, str):
+                    user_tz = str(user_tz)
+                try:
+                    dt = dtparser.parse(user_time_str)
+                    if dt.tzinfo is None:
+                        # Try to localize to user_tz if possible
+                        try:
+                            if not isinstance(user_tz, str):
+                                user_tz = str(user_tz)
+                            tz = pytz.timezone(user_tz)
+                        except Exception:
+                            # Try to map city to tz
+                            city_map = {'Paris': 'Europe/Paris', 'London': 'Europe/London', 'New York': 'America/New_York'}
+                            tz_name = city_map.get(str(user_tz), 'America/New_York')
+                            try:
+                                tz = pytz.timezone(str(tz_name))
+                            except Exception:
+                                tz = pytz.timezone('America/New_York')
+                        dt = tz.localize(dt)
+                    user_time_et = dt.astimezone(ET)
+                    print(f"User proposed time in ET: {user_time_et}")
+                    # Propose this slot if available
+                    available_slots = [{'slot': user_time_et, 'duration': preferences.get('duration', 60)}]
+                except Exception as e:
+                    print(f"Could not parse or convert user time: {e}")
+                    # Fallback to normal slot search
+                    available_slots = find_available_slots(calendar_service, owner_email, preferences)
+            else:
+                available_slots = find_available_slots(calendar_service, owner_email, preferences)
             print(f"Available slots: {available_slots}")
 
             if not available_slots:
@@ -710,7 +762,16 @@ def process_email_request():
             hidden_data_for_body = ""
             for i, slot_data in enumerate(available_slots):
                 slot_et = slot_data['slot']
-                slots_text += f"- {slot_et.strftime('%A, %B %d at %I:%M %p ET')}\n"
+                # If user proposed a time and a zone, show both ET and user's zone
+                if user_time_et and preferences.get('time_zone'):
+                    try:
+                        user_tz = pytz.timezone(preferences['time_zone'])
+                        slot_user_tz = slot_et.astimezone(user_tz)
+                        slots_text += f"- {slot_user_tz.strftime('%A, %B %d at %I:%M %p')} {preferences['time_zone']} / {slot_et.strftime('%I:%M %p ET')}\n"
+                    except Exception:
+                        slots_text += f"- {slot_et.strftime('%A, %B %d at %I:%M %p ET')}\n"
+                else:
+                    slots_text += f"- {slot_et.strftime('%A, %B %d at %I:%M %p ET')}\n"
                 hidden_info = json.dumps({'start': slot_et.isoformat(), 'duration': slot_data['duration']})
                 hidden_data_for_body += f"<!-- data: {hidden_info} -->\n"
                 hidden_data_for_body += f'<span style="display:none;">SLOT_DATA:{hidden_info}</span>\n'
@@ -745,7 +806,13 @@ def process_email_request():
                 ]
                 recipient_names = []
                 for email in participants:
-                    name_match = re.search(rf'([\w\s\"\']+)\s*<\s*{re.escape(email)}\s*>', original_to + "," + original_cc + "," + original_from_header, re.IGNORECASE)
+                    try:
+                        # Use a robust regex for name extraction, ensure all parentheses are closed
+                        pattern = r'([\w\s\"\']+)\s*<\s*' + re.escape(email) + r'\s*>'
+                        name_match = re.search(pattern, original_to + "," + original_cc + "," + original_from_header, re.IGNORECASE)
+                    except Exception as e:
+                        print(f"Regex error in recipient name extraction: {e}")
+                        name_match = None
                     if name_match:
                         name = name_match.group(1).replace('"', '').replace("'", '').strip()
                         recipient_names.append(name)
