@@ -215,11 +215,15 @@ def create_threaded_email(sender, to, cc, subject, html_body, in_reply_to, refer
     message.attach(MIMEText(html_body, 'html'))
     return {'raw': base64.urlsafe_b64encode(message.as_bytes()).decode()}
 
-def send_email(service, user_id, message):
-  """Send an email message."""
+def send_email(service, user_id, message, thread_id=None):
+  """Send an email message, optionally in a specific thread."""
   try:
-    message = (service.users().messages().send(userId=user_id, body=message).execute())
-    return message
+    if thread_id:
+      message['threadId'] = thread_id
+      sent = (service.users().messages().send(userId=user_id, body=message, threadId=thread_id).execute())
+    else:
+      sent = (service.users().messages().send(userId=user_id, body=message).execute())
+    return sent
   except Exception as e:
     print(f'An error occurred while sending email: {e}')
     return None
@@ -472,7 +476,7 @@ def process_email_request():
 
                 clean_subject = f"Re: {subject.replace('Re: ', '')}"
                 email_message = create_threaded_email(agent_email, to_field, cc_field, clean_subject, html_body, in_reply_to=message_id_header, references=new_references)
-                send_email(gmail_service, 'me', email_message)
+                send_email(gmail_service, 'me', email_message, thread_id=thread_id)
                 print(f"[DEBUG] INITIAL_REQUEST: Sent time slot suggestions to {to_field}")
                 gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
                 print(f"[DEBUG] INITIAL_REQUEST: Marked message {msg_id} as read and set historyId {history_id}")
@@ -758,7 +762,7 @@ def process_email_request():
 
                 clean_subject = f"Re: {subject.replace('Re: ', '')}"
                 email_message = create_threaded_email(agent_email, to_field, cc_field, clean_subject, html_body, in_reply_to=message_id_header, references=new_references)
-                send_email(gmail_service, 'me', email_message)
+                send_email(gmail_service, 'me', email_message, thread_id=thread_id)
                 print(f"Sent time slot suggestions to {to_field}")
                 doc_ref.set({'timestamp': firestore.SERVER_TIMESTAMP})
                 gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
