@@ -433,7 +433,26 @@ def process_email_request():
                     hidden_data_for_body += f"<!-- data: {hidden_info} -->\n"
                     hidden_data_for_body += f'<span style="display:none;">SLOT_DATA:{hidden_info}</span>\n'
 
-                # Compose greeting
+                # --- PATCH: Extract recipient first name from signature if present ---
+                # Try to find a signature block in the current message
+                import re
+                signature_match = re.search(r'-- ?\\n([A-Za-z]+)', current_message_text)
+                if signature_match:
+                    greeting_name = signature_match.group(1)
+                else:
+                    # Fallback to previous logic (extract from email headers)
+                    recipient_names = []
+                    for email in participants:
+                        name_match = re.search(rf'([\\w\\s\\"\\']+)\\s*<\\s*{re.escape(email)}\\s*>', original_to + "," + original_cc + "," + original_from_header, re.IGNORECASE)
+                        if name_match:
+                            name = name_match.group(1).replace('"', '').replace("'", '').strip()
+                            recipient_names.append(name)
+                        else:
+                            recipient_names.append(email)
+                    greeting_name = recipient_names[0] if recipient_names else ""
+                if not greeting_name or greeting_name.lower() == 'hi':
+                    greeting_name = "Hi"
+
                 greeting_templates = [
                     "Hi {name}, I'm helping {owner} coordinate a meeting. Here are a few times that work:",
                     "Hello {name}, {owner} asked me to help schedule a meeting. Would any of these times work for you?",
@@ -441,15 +460,6 @@ def process_email_request():
                     "Greetings {name}, I'm reaching out on behalf of {owner} to propose some meeting times:",
                     "Hi {name}, here are some options from {owner}'s calendar. Let me know what works!"
                 ]
-                recipient_names = []
-                for email in participants:
-                    name_match = re.search(rf'([\w\s\"\']+)\s*<\s*{re.escape(email)}\s*>', original_to + "," + original_cc + "," + original_from_header, re.IGNORECASE)
-                    if name_match:
-                        name = name_match.group(1).replace('"', '').replace("'", '').strip()
-                        recipient_names.append(name)
-                    else:
-                        recipient_names.append(email)
-                greeting_name = ", ".join(recipient_names) if recipient_names else "there"
                 greeting_template = random.choice(greeting_templates)
                 greeting_line = greeting_template.format(name=greeting_name, owner=owner_name)
 
@@ -468,12 +478,16 @@ def process_email_request():
                 email_response = model.generate_content(prompt)
                 email_body_text = email_response.text
 
+                # --- PATCH: Professional agent signature ---
                 html_body = f"""
                 <html><body>
                 <p>{email_body_text.replace(os.linesep, '<br>')}</p>
                 {hidden_data_for_body}
-                <hr style='border:1px solid #0074D9; margin-top:24px; margin-bottom:8px;'>
-                <div style='color:#0074D9; font-weight:bold; font-family:sans-serif;'>Anntao's AI Agent</div>
+                <div style='margin-top:32px; margin-bottom:8px; border-top:1px solid #e0e0e0;'></div>
+                <div style='color:#222; font-size:13px; font-family:sans-serif; margin-top:8px;'>
+                  <strong>Anntao's AI Assistant</strong><br>
+                  <span style='color:#888;'>on behalf of {owner_name}</span>
+                </div>
                 </body></html>
                 """
 
