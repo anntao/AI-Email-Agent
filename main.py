@@ -578,58 +578,47 @@ def process_email_request():
                     preferences.update(new_prefs)
             except Exception as e:
                 print(f"Could not extract new preferences: {e}")
+            print(f"Preferences for slot search: {preferences}")
             available_slots = find_available_slots(calendar_service, owner_email, preferences)
-            # (The rest of the slot suggestion logic is unchanged and will use the new preferences if found)
+            print(f"Available slots: {available_slots}")
 
-            if available_slots:
-                # --- IMPROVEMENT 2: Ensure time slot variety ---
-                # Try to get at least one morning and one afternoon slot
-                morning_slots = [s for s in available_slots if s['slot'].hour < 12]
-                afternoon_slots = [s for s in available_slots if s['slot'].hour >= 12]
-                diverse_slots = []
-                if morning_slots:
-                    diverse_slots.append(morning_slots[0])
-                if afternoon_slots:
-                    diverse_slots.append(afternoon_slots[0])
-                # Fill up to 3 with remaining unique slots
-                for s in available_slots:
-                    if s not in diverse_slots and len(diverse_slots) < 3:
-                        diverse_slots.append(s)
-                available_slots = diverse_slots
+            if not available_slots:
+                # Fallback: offer a default slot tomorrow at 10am
+                print("No available slots found, offering default slot.")
+                tomorrow = datetime.now(ET) + timedelta(days=1)
+                default_slot = ET.localize(datetime.combine(tomorrow.date(), time(10, 0)))
+                available_slots = [{"slot": default_slot, "duration": 60}]
 
-                slots_text = ""
-                hidden_data_for_body = ""
-                for i, slot_data in enumerate(available_slots):
-                    slot_et = slot_data['slot']
-                    slots_text += f"- {slot_et.strftime('%A, %B %d at %I:%M %p ET')}\n"
-                    hidden_info = json.dumps({'start': slot_et.isoformat(), 'duration': slot_data['duration']})
-                    hidden_data_for_body += f"<!-- data: {hidden_info} -->\n"
-                    hidden_data_for_body += f'<span style="display:none;">SLOT_DATA:{hidden_info}</span>\n'
+            slots_text = ""
+            hidden_data_for_body = ""
+            for i, slot_data in enumerate(available_slots):
+                slot_et = slot_data['slot']
+                slots_text += f"- {slot_et.strftime('%A, %B %d at %I:%M %p ET')}\n"
+                hidden_info = json.dumps({'start': slot_et.isoformat(), 'duration': slot_data['duration']})
+                hidden_data_for_body += f"<!-- data: {hidden_info} -->\n"
+                hidden_data_for_body += f'<span style="display:none;">SLOT_DATA:{hidden_info}</span>\n'
 
-                # --- IMPROVEMENT 1: Greeting only non-owner, non-agent recipients ---
-                all_emails_str = original_to + "," + original_cc + "," + original_from_header
-                all_emails = list(set(re.findall(r'[\w\.+-]+@[\w\.-]+\\.[\w\.-]+', all_emails_str)))
-                participants = [email for email in all_emails if email not in [agent_email, owner_email]]
-                to_field = ", ".join(participants)
-                cc_field = owner_email
+            all_emails_str = original_to + "," + original_cc + "," + original_from_header
+            all_emails = list(set(re.findall(r'[\w\.+-]+@[\w\.-]+\\.[\w\.-]+', all_emails_str)))
+            participants = [email for email in all_emails if email not in [agent_email, owner_email]]
+            to_field = ", ".join(participants)
+            cc_field = owner_email
 
-                # If no participants (i.e., only agent is in To), CC owner (IMPROVEMENT 3)
-                if not participants:
-                    cc_field = owner_email
+            if not participants:
+                print("No valid participants found for To field. Using original sender as recipient.")
+                # Try to extract sender from original_from_header
+                sender_match = re.search(r'[\w\.+-]+@[\w\.-]+\\.[\w\.-]+', original_from_header)
+                if sender_match:
+                    to_field = sender_match.group(0)
+                else:
+                    print("Could not extract sender email. Aborting send.")
+                    return "No valid recipient found.", 500
 
-                # For greeting, use names or emails of participants
-                recipient_names = []
-                for email in participants:
-                    # Try to extract name from headers
-                    name_match = re.search(rf'([\w\s\"\']+)\s*<\s*{re.escape(email)}\s*>', original_to + "," + original_cc + "," + original_from_header, re.IGNORECASE)
-                    if name_match:
-                        name = name_match.group(1).replace('"', '').replace("'", '').strip()
-                        recipient_names.append(name)
-                    else:
-                        recipient_names.append(email)
-                greeting_name = ", ".join(recipient_names) if recipient_names else "there"
+            print(f"To field: {to_field}, CC field: {cc_field}")
 
-                # --- IMPROVEMENT: Greeting variety ---
+            try:
+                genai.configure(api_key=gemini_api_key)
+                model = genai.GenerativeModel('gemini-2.5-flash')
                 greeting_templates = [
                     "Hi {name}, I'm helping {owner} coordinate a meeting. Here are a few times that work:",
                     "Hello {name}, {owner} asked me to help schedule a meeting. Would any of these times work for you?",
@@ -637,11 +626,18 @@ def process_email_request():
                     "Greetings {name}, I'm reaching out on behalf of {owner} to propose some meeting times:",
                     "Hi {name}, here are some options from {owner}'s calendar. Let me know what works!"
                 ]
+                recipient_names = []
+                for email in participants:
+                    name_match = re.search(rf'([\w\s\"\']+)\s*<\s*{re.escape(email)}\s*>', original_to + "," + original_cc + "," + original_from_header, re.IGNORECASE)
+                    if name_match:
+                        name = name_match.group(1).replace('"', '').replace("'", '').strip()
+                        recipient_names.append(name)
+                    else:
+                        recipient_names.append(email)
+                greeting_name = ", ".join(recipient_names) if recipient_names else "there"
                 greeting_template = random.choice(greeting_templates)
                 greeting_line = greeting_template.format(name=greeting_name, owner=owner_name)
 
-                genai.configure(api_key=gemini_api_key)
-                model = genai.GenerativeModel('gemini-2.5-flash')
                 prompt = f"""
                 You are a helpful AI assistant for {owner_name}.
                 Write a brief, friendly, and natural-sounding email to {greeting_name} to propose meeting times.
@@ -665,15 +661,15 @@ def process_email_request():
                 """
 
                 clean_subject = f"Re: {subject.replace('Re: ', '')}"
-
                 email_message = create_threaded_email(agent_email, to_field, cc_field, clean_subject, html_body, in_reply_to=message_id_header, references=new_references)
                 send_email(gmail_service, 'me', email_message)
                 print(f"Sent time slot suggestions to {to_field}")
                 doc_ref.set({'timestamp': firestore.SERVER_TIMESTAMP})
                 gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
                 print(f"Marked message {msg_id} as read and set historyId {history_id}")
-            else:
-                 print("No available slots found matching the criteria.")
+            except Exception as e:
+                print(f"Exception during slot suggestion or email send: {e}")
+                return "Error sending email.", 500
 
     except Exception as e:
         print(f"An error occurred during processing: {e}")
