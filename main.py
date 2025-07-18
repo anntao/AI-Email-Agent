@@ -350,9 +350,31 @@ def process_email_request():
 
         subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
         
-        full_email_text = get_full_email_body(message['payload'])
-        print(f"Extracted email text length: {len(full_email_text)}")
-        print(f"Email text preview (first 500 chars): {full_email_text[:500]}")
+        # Get the current message content
+        current_message_text = get_full_email_body(message['payload'])
+        print(f"Current message text length: {len(current_message_text)}")
+        print(f"Current message preview (first 500 chars): {current_message_text[:500]}")
+        
+        # Get the full thread content by fetching the thread
+        thread_id = message.get('threadId')
+        full_thread_text = current_message_text  # Start with current message
+        
+        if thread_id:
+            try:
+                thread = gmail_service.users().threads().get(userId='me', id=thread_id).execute()
+                print(f"Thread has {len(thread.get('messages', []))} messages")
+                
+                # Combine all messages in the thread
+                for msg in thread.get('messages', []):
+                    if msg['id'] != msg_id:  # Skip current message (already processed)
+                        thread_msg_text = get_full_email_body(msg['payload'])
+                        full_thread_text += "\n\n--- THREAD MESSAGE ---\n\n" + thread_msg_text
+                        print(f"Added thread message: {len(thread_msg_text)} chars")
+            except Exception as e:
+                print(f"Could not fetch full thread: {e}")
+        
+        print(f"Full thread text length: {len(full_thread_text)}")
+        print(f"Full thread preview (first 500 chars): {full_thread_text[:500]}")
         
         message_id_header = next((h['value'] for h in headers if h['name'].lower() == 'message-id'), None)
         references_header = next((h['value'] for h in headers if h['name'].lower() == 'references'), '')
@@ -366,7 +388,7 @@ def process_email_request():
              print(f"Owner ({owner_email}) not in participants. Ignoring email.")
              return "Owner not in thread, request ignored.", 200
         
-        intent_response = get_conversation_intent_with_ai(full_email_text, datetime.now(ET), gemini_api_key)
+        intent_response = get_conversation_intent_with_ai(full_thread_text, datetime.now(ET), gemini_api_key)
         intent = intent_response.get("intent")
         intent_data = intent_response.get("data")
 
@@ -377,8 +399,8 @@ def process_email_request():
             if confirmed_start_time_iso:
                 print(f"AI returned confirmed time: {confirmed_start_time_iso}")
                 # Search for both HTML comments and invisible spans
-                hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', full_email_text)
-                slot_data_matches = re.findall(r'SLOT_DATA:(.*?)</span>', full_email_text)
+                hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', full_thread_text)
+                slot_data_matches = re.findall(r'SLOT_DATA:(.*?)</span>', full_thread_text)
                 
                 # Combine both types of matches
                 all_hidden_matches = hidden_data_matches + slot_data_matches
@@ -386,17 +408,17 @@ def process_email_request():
                 print(f"Total hidden data matches: {len(all_hidden_matches)}")
                 
                 # Debug: search for any HTML comments
-                all_comments = re.findall(r'<!--.*?-->', full_email_text)
+                all_comments = re.findall(r'<!--.*?-->', full_thread_text)
                 print(f"Total HTML comments found: {len(all_comments)}")
                 for i, comment in enumerate(all_comments[:3]):  # Show first 3 comments
                     print(f"Comment {i+1}: {comment}")
                 
                 # Debug: search for "data:" anywhere in the text
-                data_occurrences = full_email_text.count('data:')
+                data_occurrences = full_thread_text.count('data:')
                 print(f"Occurrences of 'data:' in email: {data_occurrences}")
                 
                 # Debug: search for "SLOT_DATA:" anywhere in the text
-                slot_data_occurrences = full_email_text.count('SLOT_DATA:')
+                slot_data_occurrences = full_thread_text.count('SLOT_DATA:')
                 print(f"Occurrences of 'SLOT_DATA:' in email: {slot_data_occurrences}")
                 
                 duration = 60 
@@ -465,8 +487,8 @@ def process_email_request():
             if day_name:
                 print(f"User confirmed day: {day_name}, time preference: {time_of_day}")
                 # Search for both HTML comments and invisible spans
-                hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', full_email_text)
-                slot_data_matches = re.findall(r'SLOT_DATA:(.*?)</span>', full_email_text)
+                hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', full_thread_text)
+                slot_data_matches = re.findall(r'SLOT_DATA:(.*?)</span>', full_thread_text)
                 
                 # Combine both types of matches
                 all_hidden_matches = hidden_data_matches + slot_data_matches
