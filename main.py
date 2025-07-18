@@ -397,7 +397,7 @@ def process_email_request():
                 print(f"[DEBUG] INITIAL_REQUEST: Available slots: {available_slots}")
 
                 all_emails_str = original_to + "," + original_cc + "," + original_from_header
-                all_emails = list(set(re.findall(r'[\w\.+-]+@[\w\.-]+\\.[\w\.-]+', all_emails_str)))
+                all_emails = list(set(re.findall(r'[\w\.+-]+@[\w\.-]+\.[\w\.-]+', all_emails_str)))
                 participants = [email for email in all_emails if email not in [agent_email, owner_email]]
                 to_field = ", ".join(participants)
                 cc_field = owner_email
@@ -406,7 +406,7 @@ def process_email_request():
 
                 if not participants:
                     print("[DEBUG] INITIAL_REQUEST: No valid participants found for To field. Using original sender as recipient.")
-                    sender_match = re.search(r'[\w\.+-]+@[\w\.-]+\\.[\w\.-]+', original_from_header)
+                    sender_match = re.search(r'[\w\.+-]+@[\w\.-]+\.[\w\.-]+', original_from_header)
                     if sender_match:
                         to_field = sender_match.group(0)
                     else:
@@ -502,12 +502,10 @@ def process_email_request():
                     print(f"Comment {i+1}: {comment}")
                 
                 # Debug: search for "data:" anywhere in the text
-                data_occurrences = full_thread_text.count('data:')
-                print(f"Occurrences of 'data:' in email: {data_occurrences}")
-                
-                # Debug: search for "SLOT_DATA:" anywhere in the text
-                slot_data_occurrences = full_thread_text.count('SLOT_DATA:')
-                print(f"Occurrences of 'SLOT_DATA:' in email: {slot_data_occurrences}")
+                all_comments = re.findall(r'<!--.*?-->', full_thread_text)
+                print(f"Total HTML comments found: {len(all_comments)}")
+                for i, comment in enumerate(all_comments[:3]):  # Show first 3 comments
+                    print(f"Comment {i+1}: {comment}")
                 
                 duration = 60 
                 found_match = False
@@ -695,7 +693,7 @@ def process_email_request():
                 hidden_data_for_body += f'<span style="display:none;">SLOT_DATA:{hidden_info}</span>\n'
 
             all_emails_str = original_to + "," + original_cc + "," + original_from_header
-            all_emails = list(set(re.findall(r'[\w\.+-]+@[\w\.-]+\\.[\w\.-]+', all_emails_str)))
+            all_emails = list(set(re.findall(r'[\w\.+-]+@[\w\.-]+\.[\w\.-]+', all_emails_str)))
             participants = [email for email in all_emails if email not in [agent_email, owner_email]]
             to_field = ", ".join(participants)
             cc_field = owner_email
@@ -703,7 +701,7 @@ def process_email_request():
             if not participants:
                 print("No valid participants found for To field. Using original sender as recipient.")
                 # Try to extract sender from original_from_header
-                sender_match = re.search(r'[\w\.+-]+@[\w\.-]+\\.[\w\.-]+', original_from_header)
+                sender_match = re.search(r'[\w\.+-]+@[\w\.-]+\.[\w\.-]+', original_from_header)
                 if sender_match:
                     to_field = sender_match.group(0)
                 else:
