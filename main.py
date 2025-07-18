@@ -375,10 +375,13 @@ def process_email_request():
         original_to = next((h['value'] for h in headers if h['name'].lower() == 'to'), '')
         original_cc = next((h['value'] for h in headers if h['name'].lower() == 'cc'), '')
         original_from_header = next((h['value'] for h in headers if h['name'].lower() == 'from'), '')
-        
+        print(f"owner_email: {owner_email}")
+        print(f"original_to: {original_to}")
+        print(f"original_cc: {original_cc}")
+        print(f"original_from_header: {original_from_header}")
         if owner_email not in (original_to + original_cc + original_from_header):
-             print(f"Owner ({owner_email}) not in participants. Ignoring email.")
-             return "Owner not in thread, request ignored.", 200
+            print(f"Owner ({owner_email}) not in participants. Ignoring email.")
+            return "Owner not in thread, request ignored.", 200
         
         intent_response = get_conversation_intent_with_ai(full_thread_text, datetime.now(ET), gemini_api_key)
         intent = intent_response.get("intent")
