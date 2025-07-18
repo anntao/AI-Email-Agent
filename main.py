@@ -293,32 +293,23 @@ def process_email_request():
         data = json.loads(base64.b64decode(envelope['message']['data']).decode('utf-8'))
         history_id = str(data['historyId'])
         doc_ref = db.collection('processed_history').document(history_id)
-        
-        @firestore.transactional
-        def check_and_set_history(transaction, doc_ref):
-            snapshot = doc_ref.get(transaction=transaction)
-            if snapshot.exists:
-                return True
-            else:
-                transaction.set(doc_ref, {'timestamp': firestore.SERVER_TIMESTAMP})
-                return False
 
-        transaction = db.transaction()
-        is_duplicate = check_and_set_history(transaction, doc_ref)
-
-        if is_duplicate:
+        # --- MOVE: Deduplication check to very start ---
+        snapshot = doc_ref.get()
+        if snapshot.exists:
             print(f"Duplicate historyId detected: {history_id}. Ignoring.")
             return "Duplicate message", 200
 
     except Exception as e:
         print(f"Firestore deduplication check failed: {e}")
         return "Internal Server Error", 500
-    
+
     sleep_timer.sleep(5)
     
-    agent_email = 'anntaoai@gmail.com'
-    owner_email = 'anntaod@gmail.com'
-    owner_name = 'Anntao'
+    # Remove hardcoded values and fetch from Secret Manager
+    agent_email = get_secret(project_id, "agent-email")
+    owner_email = get_secret(project_id, "owner-email")
+    owner_name = get_secret(project_id, "owner-name")
 
     creds = authenticate_with_secrets(project_id)
     if not creds:
@@ -476,6 +467,9 @@ def process_email_request():
 
                     create_calendar_event(calendar_service, owner_email, f"Meeting: {subject.replace('Re: ', '')}", start_time_et, duration, attendees)
                     print(f"Event scheduled with {', '.join(attendees)}")
+                    doc_ref.set({'timestamp': firestore.SERVER_TIMESTAMP})
+                    gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
+                    print(f"Marked message {msg_id} as read and set historyId {history_id}")
                 else:
                     print(f"AI confirmed a time ({confirmed_start_time_iso}), but it was not one of the options offered. Ignoring.")
                     print(f"Available options were: {[datetime.fromisoformat(json.loads(match)['start']).astimezone(ET).strftime('%Y-%m-%d %H:%M ET') for match in hidden_data_matches]}")
@@ -551,6 +545,9 @@ def process_email_request():
                     create_calendar_event(calendar_service, owner_email, f"Meeting: {subject.replace('Re: ', '')}", 
                                        selected_slot['datetime'], selected_slot['duration'], attendees)
                     print(f"Event scheduled with {', '.join(attendees)}")
+                    doc_ref.set({'timestamp': firestore.SERVER_TIMESTAMP})
+                    gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
+                    print(f"Marked message {msg_id} as read and set historyId {history_id}")
                 else:
                     print(f"No available slots found for {day_name} with time preference: {time_of_day}")
             else:
@@ -672,6 +669,9 @@ def process_email_request():
                 email_message = create_threaded_email(agent_email, to_field, cc_field, clean_subject, html_body, in_reply_to=message_id_header, references=new_references)
                 send_email(gmail_service, 'me', email_message)
                 print(f"Sent time slot suggestions to {to_field}")
+                doc_ref.set({'timestamp': firestore.SERVER_TIMESTAMP})
+                gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
+                print(f"Marked message {msg_id} as read and set historyId {history_id}")
             else:
                  print("No available slots found matching the criteria.")
 
