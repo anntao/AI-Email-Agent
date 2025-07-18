@@ -297,6 +297,7 @@ def process_email_request():
         doc_ref = db.collection('processed_history').document(history_id)
 
         # --- PATCH: Use Firestore transaction for atomic deduplication ---
+        @firestore.transactional
         def dedup_transaction(transaction, doc_ref):
             snapshot = doc_ref.get(transaction=transaction)
             if snapshot.exists:
@@ -305,8 +306,7 @@ def process_email_request():
             transaction.set(doc_ref, {'timestamp': firestore.SERVER_TIMESTAMP})
             return True
 
-        transaction = db.transaction()
-        dedup_result = dedup_transaction(transaction, doc_ref)
+        dedup_result = dedup_transaction(db.transaction(), doc_ref)
         if not dedup_result:
             return "Duplicate message", 200
 
