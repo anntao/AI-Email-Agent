@@ -388,7 +388,99 @@ def process_email_request():
         intent_data = intent_response.get("data")
         print(f"Intent detected: {intent}, proceeding to slot generation...")
 
-        if intent == "CONFIRMATION":
+        # --- PATCH: Add robust debug and exception logging for INITIAL_REQUEST ---
+        if intent == "INITIAL_REQUEST":
+            try:
+                print("[DEBUG] INITIAL_REQUEST: About to generate slots...")
+                preferences = intent_data or {}
+                available_slots = find_available_slots(calendar_service, owner_email, preferences)
+                print(f"[DEBUG] INITIAL_REQUEST: Available slots: {available_slots}")
+
+                all_emails_str = original_to + "," + original_cc + "," + original_from_header
+                all_emails = list(set(re.findall(r'[\w\.+-]+@[\w\.-]+\\.[\w\.-]+', all_emails_str)))
+                participants = [email for email in all_emails if email not in [agent_email, owner_email]]
+                to_field = ", ".join(participants)
+                cc_field = owner_email
+
+                print(f"[DEBUG] INITIAL_REQUEST: To field: {to_field}, CC field: {cc_field}")
+
+                if not participants:
+                    print("[DEBUG] INITIAL_REQUEST: No valid participants found for To field. Using original sender as recipient.")
+                    sender_match = re.search(r'[\w\.+-]+@[\w\.-]+\\.[\w\.-]+', original_from_header)
+                    if sender_match:
+                        to_field = sender_match.group(0)
+                    else:
+                        print("[DEBUG] INITIAL_REQUEST: Could not extract sender email. Aborting send.")
+                        return "No valid recipient found.", 500
+
+                # Compose slots text and hidden data
+                slots_text = ""
+                hidden_data_for_body = ""
+                for i, slot_data in enumerate(available_slots):
+                    slot_et = slot_data['slot']
+                    slots_text += f"- {slot_et.strftime('%A, %B %d at %I:%M %p ET')}\n"
+                    hidden_info = json.dumps({'start': slot_et.isoformat(), 'duration': slot_data['duration']})
+                    hidden_data_for_body += f"<!-- data: {hidden_info} -->\n"
+                    hidden_data_for_body += f'<span style="display:none;">SLOT_DATA:{hidden_info}</span>\n'
+
+                # Compose greeting
+                greeting_templates = [
+                    "Hi {name}, I'm helping {owner} coordinate a meeting. Here are a few times that work:",
+                    "Hello {name}, {owner} asked me to help schedule a meeting. Would any of these times work for you?",
+                    "Hey {name}, I'm assisting {owner} with scheduling. Please let me know if any of these times are good:",
+                    "Greetings {name}, I'm reaching out on behalf of {owner} to propose some meeting times:",
+                    "Hi {name}, here are some options from {owner}'s calendar. Let me know what works!"
+                ]
+                recipient_names = []
+                for email in participants:
+                    name_match = re.search(rf'([\w\s\"\']+)\s*<\s*{re.escape(email)}\s*>', original_to + "," + original_cc + "," + original_from_header, re.IGNORECASE)
+                    if name_match:
+                        name = name_match.group(1).replace('"', '').replace("'", '').strip()
+                        recipient_names.append(name)
+                    else:
+                        recipient_names.append(email)
+                greeting_name = ", ".join(recipient_names) if recipient_names else "there"
+                greeting_template = random.choice(greeting_templates)
+                greeting_line = greeting_template.format(name=greeting_name, owner=owner_name)
+
+                prompt = f"""
+                You are a helpful AI assistant for {owner_name}.
+                Write a brief, friendly, and natural-sounding email to {greeting_name} to propose meeting times.
+                Start the email with this line: '{greeting_line}'
+                The available time slots are:
+                {slots_text}
+                Your response should be conversational and not robotic.
+                Do NOT include a subject line in your response.
+                End by saying something like, \"Let me know if any of these work for you!\"
+                """
+                genai.configure(api_key=gemini_api_key)
+                model = genai.GenerativeModel('gemini-2.5-flash')
+                email_response = model.generate_content(prompt)
+                email_body_text = email_response.text
+
+                html_body = f"""
+                <html><body>
+                <p>{email_body_text.replace(os.linesep, '<br>')}</p>
+                {hidden_data_for_body}
+                <hr style='border:1px solid #0074D9; margin-top:24px; margin-bottom:8px;'>
+                <div style='color:#0074D9; font-weight:bold; font-family:sans-serif;'>Anntao's AI Agent</div>
+                </body></html>
+                """
+
+                clean_subject = f"Re: {subject.replace('Re: ', '')}"
+                email_message = create_threaded_email(agent_email, to_field, cc_field, clean_subject, html_body, in_reply_to=message_id_header, references=new_references)
+                send_email(gmail_service, 'me', email_message)
+                print(f"[DEBUG] INITIAL_REQUEST: Sent time slot suggestions to {to_field}")
+                doc_ref.set({'timestamp': firestore.SERVER_TIMESTAMP})
+                gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
+                print(f"[DEBUG] INITIAL_REQUEST: Marked message {msg_id} as read and set historyId {history_id}")
+            except Exception as e:
+                import traceback
+                print(f"[ERROR] Exception in INITIAL_REQUEST branch: {e}")
+                traceback.print_exc()
+                return "Error in INITIAL_REQUEST", 500
+
+        elif intent == "CONFIRMATION":
             print("AI detected CONFIRMATION intent.")
             confirmed_start_time_iso = intent_data.get('confirmed_start_time_iso') if intent_data else None
 
