@@ -376,8 +376,14 @@ def process_email_request():
 
             if confirmed_start_time_iso:
                 print(f"AI returned confirmed time: {confirmed_start_time_iso}")
+                # Search for both HTML comments and invisible spans
                 hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', full_email_text)
-                print(f"Found {len(hidden_data_matches)} hidden data matches in email")
+                slot_data_matches = re.findall(r'SLOT_DATA:(.*?)</span>', full_email_text)
+                
+                # Combine both types of matches
+                all_hidden_matches = hidden_data_matches + slot_data_matches
+                print(f"Found {len(hidden_data_matches)} HTML comment matches and {len(slot_data_matches)} span matches")
+                print(f"Total hidden data matches: {len(all_hidden_matches)}")
                 
                 # Debug: search for any HTML comments
                 all_comments = re.findall(r'<!--.*?-->', full_email_text)
@@ -388,6 +394,10 @@ def process_email_request():
                 # Debug: search for "data:" anywhere in the text
                 data_occurrences = full_email_text.count('data:')
                 print(f"Occurrences of 'data:' in email: {data_occurrences}")
+                
+                # Debug: search for "SLOT_DATA:" anywhere in the text
+                slot_data_occurrences = full_email_text.count('SLOT_DATA:')
+                print(f"Occurrences of 'SLOT_DATA:' in email: {slot_data_occurrences}")
                 
                 duration = 60 
                 found_match = False
@@ -407,7 +417,7 @@ def process_email_request():
                     print(f"Error parsing confirmed time: {e}")
                     return "Error parsing confirmed time", 500
 
-                for i, hidden_info_str in enumerate(hidden_data_matches):
+                for i, hidden_info_str in enumerate(all_hidden_matches):
                     try:
                         event_data = json.loads(hidden_info_str)
                         print(f"Hidden data {i+1}: {event_data}")
@@ -454,8 +464,14 @@ def process_email_request():
 
             if day_name:
                 print(f"User confirmed day: {day_name}, time preference: {time_of_day}")
+                # Search for both HTML comments and invisible spans
                 hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', full_email_text)
-                print(f"Found {len(hidden_data_matches)} hidden data matches in email")
+                slot_data_matches = re.findall(r'SLOT_DATA:(.*?)</span>', full_email_text)
+                
+                # Combine both types of matches
+                all_hidden_matches = hidden_data_matches + slot_data_matches
+                print(f"Found {len(hidden_data_matches)} HTML comment matches and {len(slot_data_matches)} span matches")
+                print(f"Total hidden data matches: {len(all_hidden_matches)}")
                 
                 # Find the next occurrence of this day
                 weekday_map = {
@@ -469,7 +485,7 @@ def process_email_request():
                 
                 # Find matching slots for this day
                 matching_slots = []
-                for hidden_info_str in hidden_data_matches:
+                for hidden_info_str in all_hidden_matches:
                     try:
                         event_data = json.loads(hidden_info_str)
                         event_dt = datetime.fromisoformat(event_data['start'])
@@ -531,6 +547,8 @@ def process_email_request():
                     slots_text += f"- {slot_et.strftime('%A, %B %d at %I:%M %p ET')}\n"
                     hidden_info = json.dumps({'start': slot_et.isoformat(), 'duration': slot_data['duration']})
                     hidden_data_for_body += f"<!-- data: {hidden_info} -->\n"
+                    # Also add as invisible text for better preservation
+                    hidden_data_for_body += f'<span style="display:none;">SLOT_DATA:{hidden_info}</span>\n'
                 
                 sender_name_match = re.search(r'"?([^<"]+)"?\s*<', original_from_header)
                 recipient_name = sender_name_match.group(1).strip() if sender_name_match else "there"
