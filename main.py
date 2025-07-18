@@ -1,5 +1,6 @@
 # main.py
 # This is the production code for your Cloud Run service.
+# Version: 2025-07-17 - Added debugging for hidden data extraction
 
 import os
 import base64
