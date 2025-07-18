@@ -7,3 +7,4 @@ Flask
 gunicorn
 google-cloud-secret-manager
 google-cloud-firestore
+python-dateutil
