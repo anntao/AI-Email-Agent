@@ -383,6 +383,7 @@ def process_email_request():
         intent_response = get_conversation_intent_with_ai(full_thread_text, datetime.now(ET), gemini_api_key)
         intent = intent_response.get("intent")
         intent_data = intent_response.get("data")
+        print(f"Intent detected: {intent}, proceeding to slot generation...")
 
         if intent == "CONFIRMATION":
             print("AI detected CONFIRMATION intent.")
@@ -672,7 +673,9 @@ def process_email_request():
                 return "Error sending email.", 500
 
     except Exception as e:
+        import traceback
         print(f"An error occurred during processing: {e}")
+        traceback.print_exc()
         return "An error occurred.", 500
 
     return "Processing complete.", 200
