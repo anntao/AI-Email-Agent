@@ -229,10 +229,9 @@ def send_email(service, user_id, message, thread_id=None):
     return None
 
 def create_calendar_event(service, calendar_id, summary, start_time_et, duration_minutes, attendees):
-    """Creates an event in the owner's calendar."""
+    """Creates an event in the owner's calendar and emails all attendees."""
     start_utc = start_time_et.astimezone(pytz.utc)
     end_utc = start_utc + timedelta(minutes=duration_minutes)
-    
     event = {
         'summary': summary,
         'start': {'dateTime': start_utc.isoformat(), 'timeZone': 'America/New_York'},
@@ -240,7 +239,7 @@ def create_calendar_event(service, calendar_id, summary, start_time_et, duration
         'attendees': [{'email': email} for email in attendees],
         'reminders': {'useDefault': True},
     }
-    created_event = service.events().insert(calendarId=calendar_id, body=event, sendNotifications=True).execute()
+    created_event = service.events().insert(calendarId=calendar_id, body=event, sendUpdates='all').execute()
     print(f'Event created: {created_event.get("htmlLink")}')
 
 def get_full_email_body(payload):
@@ -591,9 +590,9 @@ def process_email_request():
                     start_time_et = confirmed_dt
                     all_emails_str = original_to + "," + original_cc + "," + original_from_header
                     attendees = list(set(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', all_emails_str)))
+                    attendees = [email for email in attendees if email != agent_email]
                     if owner_email not in attendees:
                         attendees.append(owner_email)
-                    attendees = [email for email in attendees if email != agent_email]
 
                     create_calendar_event(calendar_service, owner_email, f"Meeting: {subject.replace('Re: ', '')}", start_time_et, duration, attendees)
                     print(f"Event scheduled with {', '.join(attendees)}")
@@ -671,7 +670,8 @@ def process_email_request():
                     
                     # Schedule the meeting
                     all_emails_str = original_to + "," + original_cc + "," + original_from_header
-                    attendees = [email for email in set(re.findall(r'[\w\.+-]+@[\w\.-]+\\.[\w\.-]+', all_emails_str)) if email != agent_email]
+                    attendees = list(set(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', all_emails_str)))
+                    attendees = [email for email in attendees if email != agent_email]
                     if owner_email not in attendees:
                         attendees.append(owner_email)
 
@@ -765,7 +765,7 @@ def process_email_request():
                 # If user proposed a time and a zone, show both ET and user's zone
                 if user_time_et and preferences.get('time_zone'):
                     try:
-                        user_tz = pytz.timezone(preferences['time_zone'])
+                        user_tz = pytz.timezone(str(preferences['time_zone']))
                         slot_user_tz = slot_et.astimezone(user_tz)
                         slots_text += f"- {slot_user_tz.strftime('%A, %B %d at %I:%M %p')} {preferences['time_zone']} / {slot_et.strftime('%I:%M %p ET')}\n"
                     except Exception:
@@ -835,12 +835,23 @@ def process_email_request():
                 email_response = model.generate_content(prompt)
                 email_body_text = email_response.text
 
+                # --- PATCH: Consistent professional signature and simplified greeting for all agent emails ---
+                # Replace all email body composition (INITIAL_REQUEST, OTHER, etc) with:
+                # greeting_line = 'Hi'<br><br> + email_body_text
+                # signature_html = ... (the new professional signature)
+                # html_body = f"<html><body><p>{greeting_line}{email_body_text.replace(os.linesep, '<br>')}</p>{hidden_data_for_body}{signature_html}</body></html>"
+                signature_html = f"""
+                <div style='margin-top:32px; margin-bottom:8px; border-top:1px solid #e0e0e0;'></div>
+                <div style='color:#222; font-size:13px; font-family:sans-serif; margin-top:8px;'>
+                  <strong>Anntao's AI Assistant</strong><br>
+                  <span style='color:#888;'>on behalf of {owner_name}</span>
+                </div>
+                """
                 html_body = f"""
                 <html><body>
-                <p>{email_body_text.replace(os.linesep, '<br>')}</p>
+                <p>{greeting_line}<br><br>{email_body_text.replace(os.linesep, '<br>')}</p>
                 {hidden_data_for_body}
-                <hr style='border:1px solid #0074D9; margin-top:24px; margin-bottom:8px;'>
-                <div style='color:#0074D9; font-weight:bold; font-family:sans-serif;'>Anntao's AI Agent</div>
+                {signature_html}
                 </body></html>
                 """
 
