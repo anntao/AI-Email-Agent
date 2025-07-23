@@ -574,9 +574,10 @@ def process_email_request():
                             event_dt = event_dt.astimezone(ET)
                         event_dt_rounded = event_dt.replace(second=0, microsecond=0)
                         
-                        print(f"Comparing: AI='{confirmed_dt_rounded}' vs Option='{event_dt_rounded}' (match: {confirmed_dt_rounded == event_dt_rounded})")
-
-                        if confirmed_dt_rounded == event_dt_rounded:
+                        # --- PATCH: Robust slot confirmation matching (±5 min) ---
+                        delta = abs((confirmed_dt_rounded - event_dt_rounded).total_seconds())
+                        print(f"Comparing: AI='{confirmed_dt_rounded}' vs Option='{event_dt_rounded}' (delta: {delta} seconds)")
+                        if delta <= 5 * 60:
                             duration = event_data['duration']
                             found_match = True
                             print(f"Found matching slot! Duration: {duration} minutes")
