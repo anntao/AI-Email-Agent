@@ -31,6 +31,7 @@ SCOPES = ['https://mail.google.com/', 'https://www.googleapis.com/auth/calendar'
 ET = pytz.timezone('America/New_York')
 WORK_START_HOUR_ET = 9.5  # 9:30 AM
 WORK_END_HOUR_ET = 18.0   # 6:00 PM
+AGENT_DISPLAY_NAME = "Anntao's AI Assistant"
 
 # --- Helper function to get secrets ---
 def get_secret(project_id, secret_id, version_id="latest"):
@@ -207,13 +208,13 @@ def create_threaded_email(sender, to, cc, subject, html_body, in_reply_to, refer
     """Creates a MIME message that will reply in the same thread."""
     message = MIMEMultipart('alternative')
     message['to'] = to
-    message['from'] = sender
+    # --- PATCH: Set display name in From header ---
+    message['from'] = f"{AGENT_DISPLAY_NAME} <{sender}>"
     message['cc'] = cc
     message['subject'] = subject
     message['In-Reply-To'] = in_reply_to
     message['References'] = references
     message['X-Agent-Processed'] = 'true'
-    
     message.attach(MIMEText(html_body, 'html'))
     return {'raw': base64.urlsafe_b64encode(message.as_bytes()).decode()}
 
@@ -463,25 +464,15 @@ def process_email_request():
                 if not greeting_name or greeting_name.lower() == 'hi':
                     greeting_name = "Hi"
 
-                greeting_templates = [
-                    "Hi {name}, I'm helping {owner} coordinate a meeting. Here are a few times that work:",
-                    "Hello {name}, {owner} asked me to help schedule a meeting. Would any of these times work for you?",
-                    "Hey {name}, I'm assisting {owner} with scheduling. Please let me know if any of these times are good:",
-                    "Greetings {name}, I'm reaching out on behalf of {owner} to propose some meeting times:",
-                    "Hi {name}, here are some options from {owner}'s calendar. Let me know what works!"
-                ]
-                greeting_template = random.choice(greeting_templates)
-                greeting_line = greeting_template.format(name=greeting_name, owner=owner_name)
-
+                # --- In all agent email composition (INITIAL_REQUEST, OTHER, etc):
+                # 1. Remove greeting_template, greeting_name, and Gemini greeting prompt logic.
+                # 2. Only ask Gemini for the main body (slot list, instructions, etc.).
+                # 3. Always prepend 'Hi<br><br>' to the email body in the HTML.
                 prompt = f"""
                 You are a helpful AI assistant for {owner_name}.
-                Write a brief, friendly, and natural-sounding email to {greeting_name} to propose meeting times.
-                Start the email with this line: '{greeting_line}'
-                The available time slots are:
+                Write a brief, friendly, and natural-sounding email to propose meeting times. Do NOT include a greeting or recipient name. The available time slots are:
                 {slots_text}
-                Your response should be conversational and not robotic.
-                Do NOT include a subject line in your response.
-                End by saying something like, \"Let me know if any of these work for you!\"
+                Your response should be conversational and not robotic. Do NOT include a subject line or greeting. End by saying something like, 'Let me know if any of these work for you!'
                 """
                 genai.configure(api_key=gemini_api_key)
                 model = genai.GenerativeModel('gemini-2.5-flash')
@@ -491,7 +482,7 @@ def process_email_request():
                 # --- PATCH: Professional agent signature ---
                 html_body = f"""
                 <html><body>
-                <p>{email_body_text.replace(os.linesep, '<br>')}</p>
+                <p>Hi<br><br>{email_body_text.replace(os.linesep, '<br>')}</p>
                 {hidden_data_for_body}
                 <div style='margin-top:32px; margin-bottom:8px; border-top:1px solid #e0e0e0;'></div>
                 <div style='color:#222; font-size:13px; font-family:sans-serif; margin-top:8px;'>
@@ -798,40 +789,15 @@ def process_email_request():
             try:
                 genai.configure(api_key=gemini_api_key)
                 model = genai.GenerativeModel('gemini-2.5-flash')
-                greeting_templates = [
-                    "Hi {name}, I'm helping {owner} coordinate a meeting. Here are a few times that work:",
-                    "Hello {name}, {owner} asked me to help schedule a meeting. Would any of these times work for you?",
-                    "Hey {name}, I'm assisting {owner} with scheduling. Please let me know if any of these times are good:",
-                    "Greetings {name}, I'm reaching out on behalf of {owner} to propose some meeting times:",
-                    "Hi {name}, here are some options from {owner}'s calendar. Let me know what works!"
-                ]
-                recipient_names = []
-                for email in participants:
-                    try:
-                        # Use a robust regex for name extraction, ensure all parentheses are closed
-                        pattern = r'([\w\s\"\']+)\s*<\s*' + re.escape(email) + r'\s*>'
-                        name_match = re.search(pattern, original_to + "," + original_cc + "," + original_from_header, re.IGNORECASE)
-                    except Exception as e:
-                        print(f"Regex error in recipient name extraction: {e}")
-                        name_match = None
-                    if name_match:
-                        name = name_match.group(1).replace('"', '').replace("'", '').strip()
-                        recipient_names.append(name)
-                    else:
-                        recipient_names.append(email)
-                greeting_name = ", ".join(recipient_names) if recipient_names else "there"
-                greeting_template = random.choice(greeting_templates)
-                greeting_line = greeting_template.format(name=greeting_name, owner=owner_name)
-
+                # --- In all agent email composition (INITIAL_REQUEST, OTHER, etc):
+                # 1. Remove greeting_template, greeting_name, and Gemini greeting prompt logic.
+                # 2. Only ask Gemini for the main body (slot list, instructions, etc.).
+                # 3. Always prepend 'Hi<br><br>' to the email body in the HTML.
                 prompt = f"""
                 You are a helpful AI assistant for {owner_name}.
-                Write a brief, friendly, and natural-sounding email to {greeting_name} to propose meeting times.
-                Start the email with this line: '{greeting_line}'
-                The available time slots are:
+                Write a brief, friendly, and natural-sounding email to propose meeting times. Do NOT include a greeting or recipient name. The available time slots are:
                 {slots_text}
-                Your response should be conversational and not robotic.
-                Do NOT include a subject line in your response.
-                End by saying something like, \"Let me know if any of these work for you!\"
+                Your response should be conversational and not robotic. Do NOT include a subject line or greeting. End by saying something like, 'Let me know if any of these work for you!'
                 """
                 email_response = model.generate_content(prompt)
                 email_body_text = email_response.text
@@ -850,7 +816,7 @@ def process_email_request():
                 """
                 html_body = f"""
                 <html><body>
-                <p>{greeting_line}<br><br>{email_body_text.replace(os.linesep, '<br>')}</p>
+                <p>Hi<br><br>{email_body_text.replace(os.linesep, '<br>')}</p>
                 {hidden_data_for_body}
                 {signature_html}
                 </body></html>
