@@ -275,6 +275,24 @@ def get_full_email_body(payload):
     
     return body
 
+def maybe_refresh_gmail_watch(gmail_service, db, project_id):
+    """Check and refresh Gmail watch if expired or about to expire."""
+    topic_name = f"projects/{project_id}/topics/gmail-new-email"
+    doc_ref = db.collection('gmail_watch').document('expiration')
+    doc = doc_ref.get()
+    now_ms = int(datetime.utcnow().timestamp() * 1000)
+    needs_refresh = True
+    if doc.exists:
+        expiration = doc.to_dict().get('expiration')
+        if expiration and expiration > now_ms + 24*60*60*1000:
+            needs_refresh = False
+    if needs_refresh:
+        print("Refreshing Gmail watch...")
+        response = gmail_service.users().watch(userId='me', body={"topicName": topic_name}).execute()
+        new_expiration = int(response.get('expiration', 0))
+        doc_ref.set({'expiration': new_expiration})
+        print(f"Watch refreshed, new expiration: {new_expiration}")
+
 @app.route('/', methods=['POST'])
 def process_email_request():
     """Entry point for all requests, triggered by Pub/Sub."""
@@ -293,6 +311,13 @@ def process_email_request():
 
     gemini_api_key = os.environ.get("GEMINI_API_KEY")
     
+    # --- PATCH: Auto-refresh Gmail watch if needed ---
+    creds = authenticate_with_secrets(project_id)
+    if not creds:
+        return "Authentication failed.", 500
+    gmail_service = build('gmail', 'v1', credentials=creds)
+    maybe_refresh_gmail_watch(gmail_service, db, project_id)
+
     try:
         data = json.loads(base64.b64decode(envelope['message']['data']).decode('utf-8'))
         history_id = str(data['historyId'])
