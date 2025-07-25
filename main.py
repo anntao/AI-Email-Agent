@@ -875,18 +875,40 @@ def health_check():
 def ping_refresh_gmail_watch():
     """Ping endpoint to refresh Gmail watch, called by Cloud Scheduler."""
     try:
+        print("PING: Starting ping endpoint...")
         _, project_id = google.auth.default()
+        print(f"PING: Project ID determined: {project_id}")
         db = firestore.Client(project=project_id)
-    except google.auth.exceptions.DefaultCredentialsError:
-        print("ERROR: Could not automatically determine project ID.")
+        print("PING: Firestore client created successfully")
+    except google.auth.exceptions.DefaultCredentialsError as e:
+        print(f"PING ERROR: Could not automatically determine project ID: {e}")
+        return "Internal Server Error", 500
+    except Exception as e:
+        print(f"PING ERROR: Failed to initialize services: {e}")
         return "Internal Server Error", 500
 
-    creds = authenticate_with_secrets(project_id)
-    if not creds:
-        return "Authentication failed.", 500
-    gmail_service = build('gmail', 'v1', credentials=creds)
-    maybe_refresh_gmail_watch(gmail_service, db, project_id)
-    return "Ping: Gmail watch checked/refreshed.", 200
+    try:
+        print("PING: Attempting to authenticate with secrets...")
+        creds = authenticate_with_secrets(project_id)
+        if not creds:
+            print("PING ERROR: Authentication failed")
+            return "Authentication failed.", 500
+        print("PING: Authentication successful")
+        
+        print("PING: Building Gmail service...")
+        gmail_service = build('gmail', 'v1', credentials=creds)
+        print("PING: Gmail service built successfully")
+        
+        print("PING: Calling maybe_refresh_gmail_watch...")
+        maybe_refresh_gmail_watch(gmail_service, db, project_id)
+        print("PING: maybe_refresh_gmail_watch completed successfully")
+        
+        return "Ping: Gmail watch checked/refreshed.", 200
+    except Exception as e:
+        print(f"PING ERROR: Exception during ping processing: {e}")
+        import traceback
+        traceback.print_exc()
+        return "Internal Server Error", 500
 
 # This block is essential for the server to start.
 if __name__ == "__main__":
