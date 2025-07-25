@@ -871,6 +871,23 @@ def health_check():
     """Health check endpoint for Cloud Run."""
     return 'OK', 200
 
+@app.route('/ping', methods=['POST'])
+def ping_refresh_gmail_watch():
+    """Ping endpoint to refresh Gmail watch, called by Cloud Scheduler."""
+    try:
+        _, project_id = google.auth.default()
+        db = firestore.Client(project=project_id)
+    except google.auth.exceptions.DefaultCredentialsError:
+        print("ERROR: Could not automatically determine project ID.")
+        return "Internal Server Error", 500
+
+    creds = authenticate_with_secrets(project_id)
+    if not creds:
+        return "Authentication failed.", 500
+    gmail_service = build('gmail', 'v1', credentials=creds)
+    maybe_refresh_gmail_watch(gmail_service, db, project_id)
+    return "Ping: Gmail watch checked/refreshed.", 200
+
 # This block is essential for the server to start.
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
