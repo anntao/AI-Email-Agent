@@ -876,39 +876,64 @@ def ping_refresh_gmail_watch():
     """Ping endpoint to refresh Gmail watch, called by Cloud Scheduler."""
     try:
         print("PING: Starting ping endpoint...")
-        _, project_id = google.auth.default()
-        print(f"PING: Project ID determined: {project_id}")
-        db = firestore.Client(project=project_id)
-        print("PING: Firestore client created successfully")
-    except google.auth.exceptions.DefaultCredentialsError as e:
-        print(f"PING ERROR: Could not automatically determine project ID: {e}")
-        return "Internal Server Error", 500
-    except Exception as e:
-        print(f"PING ERROR: Failed to initialize services: {e}")
-        return "Internal Server Error", 500
-
-    try:
-        print("PING: Attempting to authenticate with secrets...")
-        creds = authenticate_with_secrets(project_id)
-        if not creds:
-            print("PING ERROR: Authentication failed")
-            return "Authentication failed.", 500
-        print("PING: Authentication successful")
         
-        print("PING: Building Gmail service...")
-        gmail_service = build('gmail', 'v1', credentials=creds)
-        print("PING: Gmail service built successfully")
+        # Step 1: Test basic functionality
+        print("PING: Step 1 - Basic endpoint test")
         
-        print("PING: Calling maybe_refresh_gmail_watch...")
-        maybe_refresh_gmail_watch(gmail_service, db, project_id)
-        print("PING: maybe_refresh_gmail_watch completed successfully")
+        # Step 2: Test project ID determination
+        try:
+            _, project_id = google.auth.default()
+            print(f"PING: Step 2 - Project ID determined: {project_id}")
+        except Exception as e:
+            print(f"PING ERROR: Failed to get project ID: {e}")
+            return f"Project ID error: {str(e)}", 500
         
+        # Step 3: Test Firestore client
+        try:
+            db = firestore.Client(project=project_id)
+            print("PING: Step 3 - Firestore client created successfully")
+        except Exception as e:
+            print(f"PING ERROR: Failed to create Firestore client: {e}")
+            return f"Firestore error: {str(e)}", 500
+        
+        # Step 4: Test authentication
+        try:
+            print("PING: Step 4 - Attempting to authenticate with secrets...")
+            creds = authenticate_with_secrets(project_id)
+            if not creds:
+                print("PING ERROR: Authentication failed")
+                return "Authentication failed.", 500
+            print("PING: Step 4 - Authentication successful")
+        except Exception as e:
+            print(f"PING ERROR: Authentication exception: {e}")
+            return f"Authentication exception: {str(e)}", 500
+        
+        # Step 5: Test Gmail service
+        try:
+            print("PING: Step 5 - Building Gmail service...")
+            gmail_service = build('gmail', 'v1', credentials=creds)
+            print("PING: Step 5 - Gmail service built successfully")
+        except Exception as e:
+            print(f"PING ERROR: Failed to build Gmail service: {e}")
+            return f"Gmail service error: {str(e)}", 500
+        
+        # Step 6: Test watch refresh
+        try:
+            print("PING: Step 6 - Calling maybe_refresh_gmail_watch...")
+            maybe_refresh_gmail_watch(gmail_service, db, project_id)
+            print("PING: Step 6 - maybe_refresh_gmail_watch completed successfully")
+        except Exception as e:
+            print(f"PING ERROR: Watch refresh failed: {e}")
+            return f"Watch refresh error: {str(e)}", 500
+        
+        print("PING: All steps completed successfully!")
         return "Ping: Gmail watch checked/refreshed.", 200
+        
     except Exception as e:
-        print(f"PING ERROR: Exception during ping processing: {e}")
+        print(f"PING ERROR: Unexpected exception: {e}")
         import traceback
         traceback.print_exc()
-        return "Internal Server Error", 500
+        return f"Unexpected error: {str(e)}", 500
 
 # This block is essential for the server to start.
 if __name__ == "__main__":
