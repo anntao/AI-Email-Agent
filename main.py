@@ -146,8 +146,13 @@ def find_available_slots(service, calendar_id, preferences):
     available_slots = []
     found_days = set()
     
-    morning_end = time(12, 0)
-    afternoon_start = time(12, 0)
+    # Define time periods for variety
+    morning_start = time(9, 0)   # 9:00 AM
+    morning_end = time(12, 0)    # 12:00 PM
+    early_afternoon_start = time(12, 0)  # 12:00 PM
+    early_afternoon_end = time(15, 0)    # 3:00 PM
+    late_afternoon_start = time(15, 0)   # 3:00 PM
+    late_afternoon_end = time(18, 0)     # 6:00 PM
     
     weekday_map = {
         'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3, 'friday': 4
@@ -155,7 +160,7 @@ def find_available_slots(service, calendar_id, preferences):
     target_weekday = weekday_map.get(day_preference.lower()) if day_preference else None
     
     for day_offset in range(14):
-        if len(available_slots) >= 3:
+        if len(available_slots) >= 9:  # 3 slots per day, max 3 days
             break
             
         day_to_check_naive = (search_start_date_et + timedelta(days=day_offset)).date()
@@ -169,40 +174,65 @@ def find_available_slots(service, calendar_id, preferences):
         if target_weekday is not None and day_to_check_naive.weekday() != target_weekday:
             continue
 
-        workday_start_et = ET.localize(datetime.combine(day_to_check_naive, time(int(WORK_START_HOUR_ET), int((WORK_START_HOUR_ET*60)%60))))
-        workday_end_et = ET.localize(datetime.combine(day_to_check_naive, time(int(WORK_END_HOUR_ET), int((WORK_END_HOUR_ET*60)%60))))
-        
-        if time_of_day == "morning":
-            workday_end_et = min(workday_end_et, ET.localize(datetime.combine(day_to_check_naive, morning_end)))
-        elif time_of_day == "afternoon":
-            workday_start_et = max(workday_start_et, ET.localize(datetime.combine(day_to_check_naive, afternoon_start)))
+        # Check if we already have 3 slots for this day
+        if day_to_check_naive in found_days:
+            continue
 
-        current_slot_start_et = max(workday_start_et, now_et + timedelta(minutes=5))
+        # Define the three time periods for this day
+        time_periods = [
+            (ET.localize(datetime.combine(day_to_check_naive, morning_start)), 
+             ET.localize(datetime.combine(day_to_check_naive, morning_end))),
+            (ET.localize(datetime.combine(day_to_check_naive, early_afternoon_start)), 
+             ET.localize(datetime.combine(day_to_check_naive, early_afternoon_end))),
+            (ET.localize(datetime.combine(day_to_check_naive, late_afternoon_start)), 
+             ET.localize(datetime.combine(day_to_check_naive, late_afternoon_end)))
+        ]
         
-        while current_slot_start_et + timedelta(minutes=duration_minutes) <= workday_end_et:
-            slot_start_et = current_slot_start_et
-            slot_end_et = slot_start_et + timedelta(minutes=duration_minutes)
+        # If user specified time_of_day preference, filter periods
+        if time_of_day == "morning":
+            time_periods = [time_periods[0]]  # Only morning
+        elif time_of_day == "afternoon":
+            time_periods = time_periods[1:]   # Early and late afternoon
+        
+        day_slots_found = 0
+        for period_start, period_end in time_periods:
+            if day_slots_found >= 3:
+                break
+                
+            # Ensure period doesn't start before now
+            period_start = max(period_start, now_et + timedelta(minutes=5))
             
-            is_available = True
-            for event in busy_slots:
-                event_start_str = event['start'].get('dateTime', event['start'].get('date'))
-                event_end_str = event['end'].get('dateTime', event['end'].get('date'))
-                if 'T' not in event_start_str: continue 
-                event_start_utc = datetime.fromisoformat(event_start_str.replace('Z', '+00:00'))
-                event_end_utc = datetime.fromisoformat(event_end_str.replace('Z', '+00:00'))
-                if max(slot_start_et.astimezone(pytz.utc), event_start_utc) < min(slot_end_et.astimezone(pytz.utc), event_end_utc):
-                    is_available = False
-                    break
+            if period_start + timedelta(minutes=duration_minutes) > period_end:
+                continue
+                
+            current_slot_start_et = period_start
             
-            if is_available and day_to_check_naive not in found_days:
-                available_slots.append({'slot': slot_start_et, 'duration': duration_minutes})
-                found_days.add(day_to_check_naive)
-                if not day_preference and not start_date_str and len(found_days) >= 3:
-                    break
+            while current_slot_start_et + timedelta(minutes=duration_minutes) <= period_end:
+                slot_start_et = current_slot_start_et
+                slot_end_et = slot_start_et + timedelta(minutes=duration_minutes)
+                
+                is_available = True
+                for event in busy_slots:
+                    event_start_str = event['start'].get('dateTime', event['start'].get('date'))
+                    event_end_str = event['end'].get('dateTime', event['end'].get('date'))
+                    if 'T' not in event_start_str: continue 
+                    event_start_utc = datetime.fromisoformat(event_start_str.replace('Z', '+00:00'))
+                    event_end_utc = datetime.fromisoformat(event_end_str.replace('Z', '+00:00'))
+                    if max(slot_start_et.astimezone(pytz.utc), event_start_utc) < min(slot_end_et.astimezone(pytz.utc), event_end_utc):
+                        is_available = False
+                        break
+                
+                if is_available:
+                    available_slots.append({'slot': slot_start_et, 'duration': duration_minutes})
+                    day_slots_found += 1
+                    break  # Found one slot for this period, move to next period
+                
+                current_slot_start_et += timedelta(minutes=30)
+        
+        if day_slots_found > 0:
+            found_days.add(day_to_check_naive)
             
-            current_slot_start_et += timedelta(minutes=30)
-            
-    return available_slots[:3]
+    return available_slots[:9]  # Return up to 9 slots (3 per day, max 3 days)
 
 def create_threaded_email(sender, to, cc, subject, html_body, in_reply_to, references):
     """Creates a MIME message that will reply in the same thread."""
@@ -457,12 +487,25 @@ def process_email_request():
                 # Compose slots text and hidden data
                 slots_text = ""
                 hidden_data_for_body = ""
-                for i, slot_data in enumerate(available_slots):
+                
+                # Group slots by day for better presentation
+                slots_by_day = {}
+                for slot_data in available_slots:
                     slot_et = slot_data['slot']
-                    slots_text += f"- {slot_et.strftime('%A, %B %d at %I:%M %p ET')}\n"
-                    hidden_info = json.dumps({'start': slot_et.isoformat(), 'duration': slot_data['duration']})
-                    hidden_data_for_body += f"<!-- data: {hidden_info} -->\n"
-                    hidden_data_for_body += f'<span style="display:none;">SLOT_DATA:{hidden_info}</span>\n'
+                    day_key = slot_et.strftime('%A, %B %d')
+                    if day_key not in slots_by_day:
+                        slots_by_day[day_key] = []
+                    slots_by_day[day_key].append(slot_data)
+                
+                # Format slots grouped by day
+                for day, day_slots in slots_by_day.items():
+                    slots_text += f"\n{day}:\n"
+                    for slot_data in day_slots:
+                        slot_et = slot_data['slot']
+                        slots_text += f"  • {slot_et.strftime('%I:%M %p ET')}\n"
+                        hidden_info = json.dumps({'start': slot_et.isoformat(), 'duration': slot_data['duration']})
+                        hidden_data_for_body += f"<!-- data: {hidden_info} -->\n"
+                        hidden_data_for_body += f'<span style="display:none;">SLOT_DATA:{hidden_info}</span>\n'
 
                 # --- PATCH: Extract recipient first name from signature if present ---
                 # Try to find a signature block in the current message
@@ -777,21 +820,34 @@ def process_email_request():
 
             slots_text = ""
             hidden_data_for_body = ""
-            for i, slot_data in enumerate(available_slots):
+            
+            # Group slots by day for better presentation (same as INITIAL_REQUEST)
+            slots_by_day = {}
+            for slot_data in available_slots:
                 slot_et = slot_data['slot']
-                # If user proposed a time and a zone, show both ET and user's zone
-                if user_time_et and preferences.get('time_zone'):
-                    try:
-                        user_tz = pytz.timezone(str(preferences['time_zone']))
-                        slot_user_tz = slot_et.astimezone(user_tz)
-                        slots_text += f"- {slot_user_tz.strftime('%A, %B %d at %I:%M %p')} {preferences['time_zone']} / {slot_et.strftime('%I:%M %p ET')}\n"
-                    except Exception:
-                        slots_text += f"- {slot_et.strftime('%A, %B %d at %I:%M %p ET')}\n"
-                else:
-                    slots_text += f"- {slot_et.strftime('%A, %B %d at %I:%M %p ET')}\n"
-                hidden_info = json.dumps({'start': slot_et.isoformat(), 'duration': slot_data['duration']})
-                hidden_data_for_body += f"<!-- data: {hidden_info} -->\n"
-                hidden_data_for_body += f'<span style="display:none;">SLOT_DATA:{hidden_info}</span>\n'
+                day_key = slot_et.strftime('%A, %B %d')
+                if day_key not in slots_by_day:
+                    slots_by_day[day_key] = []
+                slots_by_day[day_key].append(slot_data)
+            
+            # Format slots grouped by day
+            for day, day_slots in slots_by_day.items():
+                slots_text += f"\n{day}:\n"
+                for slot_data in day_slots:
+                    slot_et = slot_data['slot']
+                    # If user proposed a time and a zone, show both ET and user's zone
+                    if user_time_et and preferences.get('time_zone'):
+                        try:
+                            user_tz = pytz.timezone(str(preferences['time_zone']))
+                            slot_user_tz = slot_et.astimezone(user_tz)
+                            slots_text += f"  • {slot_user_tz.strftime('%I:%M %p')} {preferences['time_zone']} / {slot_et.strftime('%I:%M %p ET')}\n"
+                        except Exception:
+                            slots_text += f"  • {slot_et.strftime('%I:%M %p ET')}\n"
+                    else:
+                        slots_text += f"  • {slot_et.strftime('%I:%M %p ET')}\n"
+                    hidden_info = json.dumps({'start': slot_et.isoformat(), 'duration': slot_data['duration']})
+                    hidden_data_for_body += f"<!-- data: {hidden_info} -->\n"
+                    hidden_data_for_body += f'<span style="display:none;">SLOT_DATA:{hidden_info}</span>\n'
 
             all_emails_str = original_to + "," + original_cc + "," + original_from_header
             all_emails = list(set(re.findall(r'[\w\.+-]+@[\w\.-]+\.[\w\.-]+', all_emails_str)))
