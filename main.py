@@ -91,6 +91,8 @@ def get_conversation_intent_with_ai(email_thread_text, current_date_et, api_key)
         - For DAY_CONFIRMATION intent, return the day name and optionally time_of_day preference.
         - If the user mentions a time without timezone, assume Eastern Time (ET).
         - Use IGNORE when the conversation is about meeting details, agenda, logistics, or other non-scheduling topics.
+        - IMPORTANT: If another AI agent or scheduling assistant has offered time slots, you can confirm one of their slots using CONFIRMATION intent.
+        - Look for time slots in the email content, even if they're from other agents or assistants.
 
         Respond with a JSON object with two keys: "intent" and "data".
         - If intent is "INITIAL_REQUEST", "data" should be a JSON object with scheduling preferences.
@@ -325,6 +327,74 @@ def maybe_refresh_gmail_watch(gmail_service, db, project_id):
         new_expiration = int(response.get('expiration', 0))
         doc_ref.set({'expiration': new_expiration})
         print(f"Watch refreshed, new expiration: {new_expiration}")
+
+def extract_time_slots_from_text(text):
+    """Extract time slots mentioned in plain text from other agents or users."""
+    time_slots = []
+    
+    # Common time patterns
+    time_patterns = [
+        r'(\d{1,2}):(\d{2})\s*(AM|PM)\s*(ET|EST|EDT)?',  # 2:30 PM ET
+        r'(\d{1,2}):(\d{2})\s*(am|pm)\s*(ET|EST|EDT)?',  # 2:30 pm ET
+        r'(\d{1,2}):(\d{2})\s*(ET|EST|EDT)',  # 2:30 ET
+        r'(\d{1,2}):(\d{2})',  # 2:30
+    ]
+    
+    # Day patterns
+    day_patterns = [
+        r'(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)',
+        r'(Mon|Tue|Wed|Thu|Fri|Sat|Sun)',
+    ]
+    
+    # Look for combinations of day + time
+    for day_pattern in day_patterns:
+        for time_pattern in time_patterns:
+            # Look for "Day at Time" pattern
+            full_pattern = rf'{day_pattern}\s+(?:at\s+)?{time_pattern}'
+            matches = re.finditer(full_pattern, text, re.IGNORECASE)
+            
+            for match in matches:
+                try:
+                    day_str = match.group(1)
+                    hour = int(match.group(2))
+                    minute = int(match.group(3))
+                    ampm = match.group(4) if len(match.groups()) > 3 else None
+                    
+                    # Convert to 24-hour format
+                    if ampm and ampm.upper() == 'PM' and hour != 12:
+                        hour += 12
+                    elif ampm and ampm.upper() == 'AM' and hour == 12:
+                        hour = 0
+                    
+                    # Find the next occurrence of this day
+                    weekday_map = {
+                        'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3, 'friday': 4,
+                        'mon': 0, 'tue': 1, 'wed': 2, 'thu': 3, 'fri': 4
+                    }
+                    target_weekday = weekday_map.get(day_str.lower())
+                    
+                    if target_weekday is not None:
+                        # Find the next occurrence of this weekday
+                        now_et = datetime.now(ET)
+                        days_ahead = (target_weekday - now_et.weekday()) % 7
+                        if days_ahead == 0:  # Today
+                            days_ahead = 7  # Next week
+                        
+                        target_date = now_et.date() + timedelta(days=days_ahead)
+                        target_time = time(hour, minute)
+                        target_datetime = ET.localize(datetime.combine(target_date, target_time))
+                        
+                        # Only include future times
+                        if target_datetime > now_et:
+                            time_slots.append({
+                                'start': target_datetime.isoformat(),
+                                'duration': 30  # Default duration
+                            })
+                except Exception as e:
+                    print(f"Error parsing time slot from text: {e}")
+                    continue
+    
+    return time_slots
 
 @app.route('/', methods=['POST'])
 def process_email_request():
@@ -598,6 +668,14 @@ def process_email_request():
                 all_hidden_matches = hidden_data_matches + slot_data_matches
                 print(f"Found {len(hidden_data_matches)} HTML comment matches and {len(slot_data_matches)} span matches")
                 print(f"Total hidden data matches: {len(all_hidden_matches)}")
+                
+                # Also search for time slots in plain text (for agent-to-agent communication)
+                text_time_slots = extract_time_slots_from_text(full_thread_text)
+                print(f"Found {len(text_time_slots)} time slots in plain text")
+                
+                # Convert text time slots to the same format as hidden data
+                for slot in text_time_slots:
+                    all_hidden_matches.append(json.dumps(slot))
                 
                 # Debug: search for any HTML comments
                 all_comments = re.findall(r'<!--.*?-->', full_thread_text)
