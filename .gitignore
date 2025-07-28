@@ -1,7 +1,8 @@
 # Credentials and Tokens
 token.json
 credentials.json
-*.json
+client_secret*.json
+oauth*.json
 
 # Python cache and virtual environments
 __pycache__/
@@ -12,3 +13,7 @@ env/
 
 # Google Cloud specific files
 .gcloud/
+
+# OS specific files
+.DS_Store
+Thumbs.db
