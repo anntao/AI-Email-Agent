@@ -666,6 +666,36 @@ def process_email_request():
 
                     create_calendar_event(calendar_service, owner_email, f"Meeting: {subject.replace('Re: ', '')}", start_time_et, duration, attendees)
                     print(f"Event scheduled with {', '.join(attendees)}")
+                    
+                    # Send confirmation email to the thread
+                    confirmation_html = f"""
+                    <html><body>
+                    <p>Hi<br><br>
+                    Perfect! I've scheduled the {duration}-minute meeting for {start_time_et.strftime('%A, %B %d at %I:%M %p ET')}.<br><br>
+                    A calendar invite has been sent to all participants. Looking forward to our meeting!<br><br>
+                    Best regards,<br>
+                    {owner_name}
+                    </p>
+                    <div style='margin-top:32px; margin-bottom:8px; border-top:1px solid #e0e0e0;'></div>
+                    <div style='color:#222; font-size:13px; font-family:sans-serif; margin-top:8px;'>
+                      <strong>Anntao's AI Assistant</strong><br>
+                      <span style='color:#888;'>on behalf of {owner_name}</span>
+                    </div>
+                    </body></html>
+                    """
+                    
+                    # Determine recipients for confirmation email
+                    all_emails_str = original_to + "," + original_cc + "," + original_from_header
+                    all_emails = list(set(re.findall(r'[\w\.+-]+@[\w\.-]+\.[\w\.-]+', all_emails_str)))
+                    participants = [email for email in all_emails if email not in [agent_email, owner_email]]
+                    to_field = ", ".join(participants) if participants else original_from_header
+                    cc_field = owner_email if owner_email not in participants else ""
+                    
+                    clean_subject = f"Re: {subject.replace('Re: ', '')}"
+                    confirmation_message = create_threaded_email(agent_email, to_field, cc_field, clean_subject, confirmation_html, in_reply_to=message_id_header, references=new_references)
+                    send_email(gmail_service, 'me', confirmation_message, thread_id=thread_id)
+                    print(f"Sent confirmation email to {to_field}")
+                    
                     doc_ref.set({'timestamp': firestore.SERVER_TIMESTAMP})
                     gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
                     print(f"Marked message {msg_id} as read and set historyId {history_id}")
@@ -748,6 +778,36 @@ def process_email_request():
                     create_calendar_event(calendar_service, owner_email, f"Meeting: {subject.replace('Re: ', '')}", 
                                        selected_slot['datetime'], selected_slot['duration'], attendees)
                     print(f"Event scheduled with {', '.join(attendees)}")
+                    
+                    # Send confirmation email to the thread
+                    confirmation_html = f"""
+                    <html><body>
+                    <p>Hi<br><br>
+                    Perfect! I've scheduled the {selected_slot['duration']}-minute meeting for {selected_slot['datetime'].strftime('%A, %B %d at %I:%M %p ET')}.<br><br>
+                    A calendar invite has been sent to all participants. Looking forward to our meeting!<br><br>
+                    Best regards,<br>
+                    {owner_name}
+                    </p>
+                    <div style='margin-top:32px; margin-bottom:8px; border-top:1px solid #e0e0e0;'></div>
+                    <div style='color:#222; font-size:13px; font-family:sans-serif; margin-top:8px;'>
+                      <strong>Anntao's AI Assistant</strong><br>
+                      <span style='color:#888;'>on behalf of {owner_name}</span>
+                    </div>
+                    </body></html>
+                    """
+                    
+                    # Determine recipients for confirmation email
+                    all_emails_str = original_to + "," + original_cc + "," + original_from_header
+                    all_emails = list(set(re.findall(r'[\w\.+-]+@[\w\.-]+\.[\w\.-]+', all_emails_str)))
+                    participants = [email for email in all_emails if email not in [agent_email, owner_email]]
+                    to_field = ", ".join(participants) if participants else original_from_header
+                    cc_field = owner_email if owner_email not in participants else ""
+                    
+                    clean_subject = f"Re: {subject.replace('Re: ', '')}"
+                    confirmation_message = create_threaded_email(agent_email, to_field, cc_field, clean_subject, confirmation_html, in_reply_to=message_id_header, references=new_references)
+                    send_email(gmail_service, 'me', confirmation_message, thread_id=thread_id)
+                    print(f"Sent confirmation email to {to_field}")
+                    
                     doc_ref.set({'timestamp': firestore.SERVER_TIMESTAMP})
                     gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
                     print(f"Marked message {msg_id} as read and set historyId {history_id}")
