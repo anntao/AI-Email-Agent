@@ -77,11 +77,12 @@ def get_conversation_intent_with_ai(email_thread_text, current_date_et, api_key)
         prompt = f"""
         Analyze the following email thread to determine the user's current intent. The current date is {current_date_et.strftime('%Y-%m-%d')}.
 
-        There are four possible intents:
+        There are five possible intents:
         1. "INITIAL_REQUEST": The user is starting a new request to schedule a meeting. Extract their preferences (duration, day_preference, time_of_day, start_date).
         2. "CONFIRMATION": The user is replying to confirm a specific time slot that was previously offered. Extract the exact ISO 8601 formatted string of the confirmed time.
         3. "DAY_CONFIRMATION": The user is confirming a specific day (e.g., "Tuesday works", "Monday is good") but not a specific time. Extract the day name and optionally a time preference.
-        4. "OTHER": The email is not related to scheduling, or it's a negotiation where no specific time was chosen.
+        4. "OTHER": The user is negotiating meeting times (e.g., "none of these work", "can you do 4pm Paris?", "I need a different time"). Extract new preferences if present.
+        5. "IGNORE": The conversation has moved beyond scheduling (e.g., discussing meeting agenda, logistics, or other topics unrelated to finding a time). The agent should not respond.
 
         The agent's previous suggestions are embedded in HTML comments like <!-- data: {{"start": "...", "duration": ...}} -->. Use these to identify if the current email is a reply to suggestions.
 
@@ -89,12 +90,14 @@ def get_conversation_intent_with_ai(email_thread_text, current_date_et, api_key)
         - For CONFIRMATION intent, the confirmed_start_time_iso must be in ISO 8601 format with timezone (e.g., "2024-01-15T14:30:00-05:00" for 2:30 PM ET). 
         - For DAY_CONFIRMATION intent, return the day name and optionally time_of_day preference.
         - If the user mentions a time without timezone, assume Eastern Time (ET).
+        - Use IGNORE when the conversation is about meeting details, agenda, logistics, or other non-scheduling topics.
 
         Respond with a JSON object with two keys: "intent" and "data".
         - If intent is "INITIAL_REQUEST", "data" should be a JSON object with scheduling preferences.
         - If intent is "CONFIRMATION", "data" should be a JSON object with the key "confirmed_start_time_iso" containing the exact time in ISO 8601 format.
         - If intent is "DAY_CONFIRMATION", "data" should be a JSON object with keys "day_name" (e.g., "tuesday", "monday") and optionally "time_of_day" (e.g., "morning", "afternoon").
-        - If intent is "OTHER", "data" can be null.
+        - If intent is "OTHER", "data" should be a JSON object with new preferences if present.
+        - If intent is "IGNORE", "data" should be null.
 
         Email Thread:
         \"\"\"
@@ -913,6 +916,14 @@ def process_email_request():
             except Exception as e:
                 print(f"Exception during slot suggestion or email send: {e}")
                 return "Error sending email.", 500
+
+        # --- NEW: Handle IGNORE intent - agent stays silent ---
+        elif intent == "IGNORE":
+            print("AI detected IGNORE intent. Conversation is not about scheduling. Agent will stay silent.")
+            # Mark message as read but don't send any response
+            gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
+            print(f"Marked message {msg_id} as read and set historyId {history_id} (no response sent)")
+            return "Conversation not about scheduling - agent staying silent", 200
 
     except Exception as e:
         import traceback
