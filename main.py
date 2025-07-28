@@ -117,7 +117,7 @@ def get_conversation_intent_with_ai(email_thread_text, current_date_et, api_key)
 
 def find_available_slots(service, calendar_id, preferences):
     """Finds available slots based on AI-parsed preferences, skipping weekends."""
-    duration_minutes = preferences.get('duration') or 60
+    duration_minutes = preferences.get('duration') or 30
     day_preference = preferences.get('day_preference')
     
     # --- FIX: Handle case where AI returns a list for day_preference ---
@@ -539,11 +539,18 @@ def process_email_request():
                 # 1. Remove greeting_template, greeting_name, and Gemini greeting prompt logic.
                 # 2. Only ask Gemini for the main body (slot list, instructions, etc.).
                 # 3. Always prepend 'Hi<br><br>' to the email body in the HTML.
+                # Get the duration from the first slot (they should all have the same duration)
+                meeting_duration = available_slots[0]['duration'] if available_slots else 30
+                
+                # --- In all agent email composition (INITIAL_REQUEST, OTHER, etc):
+                # 1. Remove greeting_template, greeting_name, and Gemini greeting prompt logic.
+                # 2. Only ask Gemini for the main body (slot list, instructions, etc.).
+                # 3. Always prepend 'Hi<br><br>' to the email body in the HTML.
                 prompt = f"""
                 You are a helpful AI assistant for {owner_name}.
-                Write a brief, friendly, and natural-sounding email to propose meeting times. Do NOT include a greeting or recipient name. The available time slots are:
+                Write a brief, friendly, and natural-sounding email to propose meeting times for a {meeting_duration}-minute meeting. Do NOT include a greeting or recipient name. The available time slots are:
                 {slots_text}
-                Your response should be conversational and not robotic. Do NOT include a subject line or greeting. End by saying something like, 'Let me know if any of these work for you!'
+                Your response should be conversational and not robotic. Mention the meeting duration ({meeting_duration} minutes) in your response. Do NOT include a subject line or greeting. End by saying something like, 'Let me know if any of these work for you!'
                 """
                 genai.configure(api_key=gemini_api_key)
                 model = genai.GenerativeModel('gemini-2.5-flash')
@@ -604,7 +611,7 @@ def process_email_request():
                 for i, comment in enumerate(all_comments[:3]):  # Show first 3 comments
                     print(f"Comment {i+1}: {comment}")
                 
-                duration = 60 
+                duration = 30
                 found_match = False
                 
                 # Parse the confirmed time from AI
@@ -753,7 +760,7 @@ def process_email_request():
         elif intent == "OTHER":
             print("AI detected OTHER intent. Checking for new preferences.")
             # Try to extract new preferences from the AI (reuse INITIAL_REQUEST logic)
-            preferences = {'duration': 60}
+            preferences = {'duration': 30}
             # Ask Gemini to extract new preferences if present, including time and time zone
             try:
                 genai.configure(api_key=gemini_api_key)
@@ -805,7 +812,7 @@ def process_email_request():
                     user_time_et = dt.astimezone(ET)
                     print(f"User proposed time in ET: {user_time_et}")
                     # Propose this slot if available
-                    available_slots = [{'slot': user_time_et, 'duration': preferences.get('duration', 60)}]
+                    available_slots = [{'slot': user_time_et, 'duration': preferences.get('duration', 30)}]
                 except Exception as e:
                     print(f"Could not parse or convert user time: {e}")
                     # Fallback to normal slot search
@@ -819,7 +826,7 @@ def process_email_request():
                 print("No available slots found, offering default slot.")
                 tomorrow = datetime.now(ET) + timedelta(days=1)
                 default_slot = ET.localize(datetime.combine(tomorrow.date(), time(10, 0)))
-                available_slots = [{"slot": default_slot, "duration": 60}]
+                available_slots = [{"slot": default_slot, "duration": 30}]
 
             slots_text = ""
             hidden_data_for_body = ""
@@ -877,11 +884,14 @@ def process_email_request():
                 # 1. Remove greeting_template, greeting_name, and Gemini greeting prompt logic.
                 # 2. Only ask Gemini for the main body (slot list, instructions, etc.).
                 # 3. Always prepend 'Hi<br><br>' to the email body in the HTML.
+                # Get the duration from the first slot (they should all have the same duration)
+                meeting_duration = available_slots[0]['duration'] if available_slots else 30
+                
                 prompt = f"""
                 You are a helpful AI assistant for {owner_name}.
-                Write a brief, friendly, and natural-sounding email to propose meeting times. Do NOT include a greeting or recipient name. The available time slots are:
+                Write a brief, friendly, and natural-sounding email to propose meeting times for a {meeting_duration}-minute meeting. Do NOT include a greeting or recipient name. The available time slots are:
                 {slots_text}
-                Your response should be conversational and not robotic. Do NOT include a subject line or greeting. End by saying something like, 'Let me know if any of these work for you!'
+                Your response should be conversational and not robotic. Mention the meeting duration ({meeting_duration} minutes) in your response. Do NOT include a subject line or greeting. End by saying something like, 'Let me know if any of these work for you!'
                 """
                 email_response = model.generate_content(prompt)
                 email_body_text = email_response.text
