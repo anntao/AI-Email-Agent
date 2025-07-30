@@ -570,15 +570,25 @@ def process_email_request():
                         slots_by_day[day_key] = []
                     slots_by_day[day_key].append(slot_data)
                 
-                # Format slots grouped by day
+                # Format slots grouped by day with proper HTML
+                slots_html = ""
+                for day, day_slots in slots_by_day.items():
+                    slots_html += f"<p><strong>{day}:</strong></p>"
+                    slots_html += "<ul>"
+                    for slot_data in day_slots:
+                        slot_et = slot_data['slot']
+                        slots_html += f"<li>{slot_et.strftime('%I:%M %p ET')}</li>"
+                        hidden_info = json.dumps({'start': slot_et.isoformat(), 'duration': slot_data['duration']})
+                        hidden_data_for_body += f"<!-- data: {hidden_info} -->\n"
+                        hidden_data_for_body += f'<span style="display:none;">SLOT_DATA:{hidden_info}</span>\n'
+                    slots_html += "</ul>"
+                
+                # Plain text version for AI prompt
                 for day, day_slots in slots_by_day.items():
                     slots_text += f"\n{day}:\n"
                     for slot_data in day_slots:
                         slot_et = slot_data['slot']
                         slots_text += f"  • {slot_et.strftime('%I:%M %p ET')}\n"
-                        hidden_info = json.dumps({'start': slot_et.isoformat(), 'duration': slot_data['duration']})
-                        hidden_data_for_body += f"<!-- data: {hidden_info} -->\n"
-                        hidden_data_for_body += f'<span style="display:none;">SLOT_DATA:{hidden_info}</span>\n'
 
                 # --- PATCH: Extract recipient first name from signature if present ---
                 # Try to find a signature block in the current message
@@ -630,7 +640,10 @@ def process_email_request():
                 # --- PATCH: Professional agent signature ---
                 html_body = f"""
                 <html><body>
-                <p>Hi<br><br>{email_body_text.replace(os.linesep, '<br>')}</p>
+                <p>Hi<br><br>
+                I'd love to schedule our {meeting_duration}-minute meeting! How about one of these times?</p>
+                {slots_html}
+                <p>Let me know if any of these work for you!</p>
                 {hidden_data_for_body}
                 <div style='margin-top:32px; margin-bottom:8px; border-top:1px solid #e0e0e0;'></div>
                 <div style='color:#222; font-size:13px; font-family:sans-serif; margin-top:8px;'>
@@ -978,7 +991,26 @@ def process_email_request():
                     slots_by_day[day_key] = []
                 slots_by_day[day_key].append(slot_data)
             
-            # Format slots grouped by day
+            # Format slots grouped by day with proper HTML
+            slots_html = ""
+            for day, day_slots in slots_by_day.items():
+                slots_html += f"<p><strong>{day}:</strong></p>"
+                slots_html += "<ul>"
+                for slot_data in day_slots:
+                    slot_et = slot_data['slot']
+                    # If user proposed a time and a zone, show both ET and user's zone
+                    if user_time_et and preferences.get('time_zone'):
+                        try:
+                            user_tz = pytz.timezone(str(preferences['time_zone']))
+                            slot_user_tz = slot_et.astimezone(user_tz)
+                            slots_html += f"<li>{slot_user_tz.strftime('%I:%M %p')} {preferences['time_zone']} / {slot_et.strftime('%I:%M %p ET')}</li>"
+                        except Exception:
+                            slots_html += f"<li>{slot_et.strftime('%I:%M %p ET')}</li>"
+                    else:
+                        slots_html += f"<li>{slot_et.strftime('%I:%M %p ET')}</li>"
+                slots_html += "</ul>"
+            
+            # Plain text version for AI prompt
             for day, day_slots in slots_by_day.items():
                 slots_text += f"\n{day}:\n"
                 for slot_data in day_slots:
@@ -993,9 +1025,6 @@ def process_email_request():
                             slots_text += f"  • {slot_et.strftime('%I:%M %p ET')}\n"
                     else:
                         slots_text += f"  • {slot_et.strftime('%I:%M %p ET')}\n"
-                    hidden_info = json.dumps({'start': slot_et.isoformat(), 'duration': slot_data['duration']})
-                    hidden_data_for_body += f"<!-- data: {hidden_info} -->\n"
-                    hidden_data_for_body += f'<span style="display:none;">SLOT_DATA:{hidden_info}</span>\n'
 
             all_emails_str = original_to + "," + original_cc + "," + original_from_header
             all_emails = list(set(re.findall(r'[\w\.+-]+@[\w\.-]+\.[\w\.-]+', all_emails_str)))
@@ -1048,7 +1077,10 @@ def process_email_request():
                 """
                 html_body = f"""
                 <html><body>
-                <p>Hi<br><br>{email_body_text.replace(os.linesep, '<br>')}</p>
+                <p>Hi<br><br>
+                Here are some alternative times for our {meeting_duration}-minute meeting:</p>
+                {slots_html}
+                <p>Let me know if any of these work for you!</p>
                 {hidden_data_for_body}
                 {signature_html}
                 </body></html>
