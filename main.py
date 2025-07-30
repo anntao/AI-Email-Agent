@@ -93,6 +93,11 @@ def get_conversation_intent_with_ai(email_thread_text, current_date_et, api_key)
         - Use IGNORE when the conversation is about meeting details, agenda, logistics, or other non-scheduling topics.
         - IMPORTANT: If another AI agent or scheduling assistant has offered time slots, you can confirm one of their slots using CONFIRMATION intent.
         - Look for time slots in the email content, even if they're from other agents or assistants.
+        - CRITICAL: For INITIAL_REQUEST and OTHER intents, pay special attention to future date requests:
+          * If user mentions "next week", calculate the start of next week (Monday) and set start_date to that date in YYYY-MM-DD format
+          * If user mentions specific dates like "August 5th" or "August 5th or 6th", extract the earliest mentioned date as start_date in YYYY-MM-DD format
+          * If user mentions relative dates like "next Monday", "next Tuesday", calculate the actual date and set start_date
+          * For specific dates, assume current year unless explicitly stated otherwise
 
         Respond with a JSON object with two keys: "intent" and "data".
         - If intent is "INITIAL_REQUEST", "data" should be a JSON object with scheduling preferences.
@@ -137,8 +142,11 @@ def find_available_slots(service, calendar_id, preferences):
         try:
             parsed_date = datetime.strptime(start_date_str, '%Y-%m-%d')
             search_start_date_et = ET.localize(parsed_date)
+            print(f"Using AI-provided start_date: {start_date_str} -> {search_start_date_et.strftime('%Y-%m-%d')}")
         except (ValueError, TypeError):
             print(f"AI provided an invalid start_date format: {start_date_str}. Using today.")
+    else:
+        print(f"No start_date provided by AI, using today: {search_start_date_et.strftime('%Y-%m-%d')}")
 
     time_min_utc = search_start_date_et.astimezone(pytz.utc).isoformat()
     time_max_utc = (search_start_date_et.astimezone(pytz.utc) + timedelta(days=14)).isoformat()
@@ -918,6 +926,13 @@ def process_email_request():
                 model = genai.GenerativeModel('gemini-2.5-flash')
                 pref_prompt = f"""
                 The user replied that none of the offered times work, or is proposing a new time. Please extract any new preferences for meeting time (such as preferred days, times, durations, or specific times) from the following email. If the user mentions a specific time (e.g., '4pm Paris'), extract both the time and the time zone/city if present. If no new preferences are found, return an empty object.
+                
+                CRITICAL: Pay special attention to future date requests:
+                * If user mentions "next week", calculate the start of next week (Monday) and set start_date to that date in YYYY-MM-DD format
+                * If user mentions specific dates like "August 5th" or "August 5th or 6th", extract the earliest mentioned date as start_date in YYYY-MM-DD format
+                * If user mentions relative dates like "next Monday", "next Tuesday", calculate the actual date and set start_date
+                * For specific dates, assume current year unless explicitly stated otherwise
+                
                 Email:
                 '''
                 {current_message_text}
