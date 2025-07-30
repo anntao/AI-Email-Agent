@@ -574,10 +574,10 @@ def process_email_request():
                 slots_html = ""
                 for day, day_slots in slots_by_day.items():
                     slots_html += f"<p><strong>{day}:</strong></p>"
-                    slots_html += "<ul>"
+                    slots_html += "<ul style='margin: 10px 0; padding-left: 20px;'>"
                     for slot_data in day_slots:
                         slot_et = slot_data['slot']
-                        slots_html += f"<li>{slot_et.strftime('%I:%M %p ET')}</li>"
+                        slots_html += f"<li style='margin: 5px 0;'>{slot_et.strftime('%I:%M %p ET')}</li>"
                         hidden_info = json.dumps({'start': slot_et.isoformat(), 'duration': slot_data['duration']})
                         hidden_data_for_body += f"<!-- data: {hidden_info} -->\n"
                         hidden_data_for_body += f'<span style="display:none;">SLOT_DATA:{hidden_info}</span>\n'
@@ -995,7 +995,7 @@ def process_email_request():
             slots_html = ""
             for day, day_slots in slots_by_day.items():
                 slots_html += f"<p><strong>{day}:</strong></p>"
-                slots_html += "<ul>"
+                slots_html += "<ul style='margin: 10px 0; padding-left: 20px;'>"
                 for slot_data in day_slots:
                     slot_et = slot_data['slot']
                     # If user proposed a time and a zone, show both ET and user's zone
@@ -1003,11 +1003,11 @@ def process_email_request():
                         try:
                             user_tz = pytz.timezone(str(preferences['time_zone']))
                             slot_user_tz = slot_et.astimezone(user_tz)
-                            slots_html += f"<li>{slot_user_tz.strftime('%I:%M %p')} {preferences['time_zone']} / {slot_et.strftime('%I:%M %p ET')}</li>"
+                            slots_html += f"<li style='margin: 5px 0;'>{slot_user_tz.strftime('%I:%M %p')} {preferences['time_zone']} / {slot_et.strftime('%I:%M %p ET')}</li>"
                         except Exception:
-                            slots_html += f"<li>{slot_et.strftime('%I:%M %p ET')}</li>"
+                            slots_html += f"<li style='margin: 5px 0;'>{slot_et.strftime('%I:%M %p ET')}</li>"
                     else:
-                        slots_html += f"<li>{slot_et.strftime('%I:%M %p ET')}</li>"
+                        slots_html += f"<li style='margin: 5px 0;'>{slot_et.strftime('%I:%M %p ET')}</li>"
                 slots_html += "</ul>"
             
             # Plain text version for AI prompt
