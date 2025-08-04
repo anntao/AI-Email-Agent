@@ -59,6 +59,32 @@ def authenticate_with_secrets(project_id):
             print("Token expired, attempting to refresh...")
             creds.refresh(Request())
             print("Token refreshed successfully for this session.")
+            
+            # Update the stored token in Secret Manager with the refreshed token
+            try:
+                updated_token_data = {
+                    'token': creds.token,
+                    'refresh_token': creds.refresh_token,
+                    'token_uri': creds.token_uri,
+                    'client_id': creds.client_id,
+                    'client_secret': creds.client_secret,
+                    'scopes': creds.scopes
+                }
+                
+                # Update the secret in Secret Manager
+                client = secretmanager.SecretManagerServiceClient()
+                secret_name = f"projects/{project_id}/secrets/agent-token-json"
+                secret_version = client.add_secret_version(
+                    request={
+                        "parent": secret_name,
+                        "payload": {"data": json.dumps(updated_token_data).encode("UTF-8")}
+                    }
+                )
+                print(f"Token updated in Secret Manager: {secret_version.name}")
+            except Exception as update_error:
+                print(f"WARNING: Could not update token in Secret Manager: {update_error}")
+                print("Token was refreshed for this session but not saved for future requests.")
+        
         return creds
     except Exception as e:
         print(f"ERROR: Could not load or refresh credentials. Error: {e}")
