@@ -27,6 +27,7 @@ class FakeStore:
         self.cursor = None
         self.watch = None
         self.rate_ok = True
+        self.rate_calls = []
 
     def claim_message(self, message_id):
         if not self.claimable or message_id in self.claims:
@@ -59,7 +60,8 @@ class FakeStore:
     def set_watch_expiration(self, ms):
         self.watch = ms
 
-    def check_rate_limit(self, sender, limit):
+    def check_rate_limit(self, sender, limit, message_id=None):
+        self.rate_calls.append((sender, message_id))
         return self.rate_ok
 
 
@@ -206,6 +208,7 @@ def test_rate_limited_sender_gets_no_reply(monkeypatch, wired):
 
     assert "rate limit" in outcome
     assert wired["sent"] == []
+    assert wired["read"] == []  # a rate-limited message is left unread
 
 
 # ---------- proposing ----------

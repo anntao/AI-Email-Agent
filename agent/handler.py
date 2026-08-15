@@ -131,9 +131,12 @@ def _process(ctx: Context, message_id: str) -> tuple[str, bool]:
         log.info("Not acting on %s: %s", message_id, auth.reason)
         return f"ignored ({auth.reason})", False
 
-    if not ctx.store.check_rate_limit(auth.sender, settings.sender_hourly_limit):
+    if not ctx.store.check_rate_limit(
+        auth.sender, settings.sender_hourly_limit, message_id=message_id
+    ):
         log.warning("Rate limit reached for %s", auth.sender)
-        return "ignored (sender rate limit reached)", True
+        # acted=False: leave the message unread so a human can still see it.
+        return "ignored (sender rate limit reached)", False
 
     thread = mailbox.get_thread(ctx.gmail, message.thread_id) if message.thread_id else []
     if not thread:

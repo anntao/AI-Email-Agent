@@ -22,6 +22,9 @@ CURSOR = "gmail_cursor"
 WATCH = "gmail_watch"
 RATE = "sender_rate"
 
+# How many recent message ids to remember per bucket, so retries are not recharged.
+RATE_HISTORY = 100
+
 STATUS_PROCESSING = "processing"
 STATUS_DONE = "done"
 STATUS_FAILED = "failed"
@@ -130,11 +133,16 @@ class Store:
 
     # ---------- per-sender rate limit ----------
 
-    def check_rate_limit(self, sender: str, limit: int) -> bool:
-        """Count one request for this sender in the current hour.
+    def check_rate_limit(self, sender: str, limit: int, message_id: Optional[str] = None) -> bool:
+        """Charge one request to this sender for the current hour.
 
         Returns False once the sender exceeds `limit` requests within the hour,
         which bounds how fast an outsider can probe the owner's availability.
+
+        Charging is idempotent per message. Without that, a message that fails
+        transiently is charged again on every redelivery, so a stretch of
+        retries burns the sender's whole quota and the message is then dropped
+        as "rate limited" — turning an outage into permanent data loss.
         """
         if limit <= 0:
             return True
@@ -144,12 +152,27 @@ class Store:
         @firestore.transactional
         def txn(transaction):
             snapshot = doc_ref.get(transaction=transaction)
-            count = (snapshot.to_dict() or {}).get("count", 0) if snapshot.exists else 0
+            data = (snapshot.to_dict() or {}) if snapshot.exists else {}
+            charged = list(data.get("charged", []))
+
+            if message_id and message_id in charged:
+                return True  # a retry of a message already counted
+
+            count = int(data.get("count", 0))
             if count >= limit:
                 return False
+
+            if message_id:
+                charged.append(message_id)
+                charged = charged[-RATE_HISTORY:]
+
             transaction.set(
                 doc_ref,
-                {"count": count + 1, "updated_at": datetime.now(timezone.utc)},
+                {
+                    "count": count + 1,
+                    "charged": charged,
+                    "updated_at": datetime.now(timezone.utc),
+                },
             )
             return True
 
@@ -158,3 +181,8 @@ class Store:
         except Exception as exc:  # noqa: BLE001 - never block scheduling on the limiter
             log.warning("Rate limit check failed for %s: %s", sender, exc)
             return True
+
+    def clear_rate_limit(self, sender: str) -> None:
+        """Drop this sender's counter for the current hour."""
+        bucket = datetime.now(timezone.utc).strftime("%Y%m%d%H")
+        self.db.collection(RATE).document(f"{sender}|{bucket}").delete()
