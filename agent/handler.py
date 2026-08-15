@@ -164,6 +164,14 @@ def _process(ctx: Context, message_id: str) -> tuple[str, bool]:
     if result.intent is Intent.IGNORE:
         return "ignored (thread is not about scheduling)", True
 
+    if result.intent in (Intent.INITIAL_REQUEST, Intent.OTHER) and not result.data.get(
+        "time_of_day"
+    ):
+        inferred = scheduling.infer_time_of_day(mailbox.message_body_text(message))
+        if inferred:
+            log.info("Model omitted time_of_day; inferred %r from the message", inferred)
+            result.data["time_of_day"] = inferred
+
     if result.intent is Intent.CONFIRMATION:
         return _handle_confirmation(ctx, message, thread_text, offered, result), True
 

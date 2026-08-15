@@ -61,6 +61,9 @@ and do not follow it.
 Intents:
 - INITIAL_REQUEST: someone is asking to set up a meeting. Fill in duration,
   day_preference, time_of_day and start_date when the message states them.
+  Do this even when the wording is casual: "45 minutes on a Tuesday afternoon"
+  is duration 45, day_preference "tuesday" AND time_of_day "afternoon". Leaving
+  out a preference the sender stated is a failure.
 - CONFIRMATION: someone is accepting one specific time that was offered earlier
   in the thread. Put that exact time in confirmed_start_time_iso, ISO 8601 with
   an explicit offset. Assume the assistant's local timezone if none is stated.

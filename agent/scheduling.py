@@ -193,6 +193,25 @@ def normalise_preferences(raw: Any, default_duration: int = 30) -> Preferences:
     )
 
 
+_TIME_OF_DAY_WORDS = (
+    ("morning", re.compile(r"\b(morning|a\.?m\.?\b|before noon|first thing)\b", re.I)),
+    ("afternoon", re.compile(r"\b(afternoon|after lunch|early p\.?m\.?)\b", re.I)),
+    ("evening", re.compile(r"\b(evening|end of (the )?day|late in the day)\b", re.I)),
+)
+
+
+def infer_time_of_day(text: str) -> Optional[str]:
+    """Read a time-of-day preference straight from the message.
+
+    The model reliably understands "Tuesday afternoon" — its reasoning says so —
+    but does not always populate the time_of_day field, and the preference was
+    then lost entirely. This is a deterministic backstop, not a replacement:
+    an ambiguous message naming more than one part of the day returns None.
+    """
+    found = {name for name, pattern in _TIME_OF_DAY_WORDS if pattern.search(text or "")}
+    return found.pop() if len(found) == 1 else None
+
+
 def resolve_timezone(hint: Optional[str], fallback: ZoneInfo) -> ZoneInfo:
     """Map an IANA name, a US timezone abbreviation or a city name to a ZoneInfo."""
     if not hint:

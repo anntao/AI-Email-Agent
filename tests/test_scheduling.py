@@ -392,3 +392,41 @@ def test_all_prefix_spellings_normalise(subject):
 
 def test_empty_subject_gets_a_placeholder():
     assert clean_subject("") == "Re: Meeting"
+
+
+# ---------- time-of-day inference ----------
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("Could we find 45 minutes on a Tuesday afternoon?", "afternoon"),
+    ("Something in the morning would suit", "morning"),
+    ("Anything after lunch works", "afternoon"),
+    ("Could we do end of the day Thursday?", "evening"),
+    ("First thing Monday if possible", "morning"),
+])
+def test_time_of_day_is_read_from_the_message(text, expected):
+    """The model understands "Tuesday afternoon" but does not always report it."""
+    from agent.scheduling import infer_time_of_day
+    assert infer_time_of_day(text) == expected
+
+
+@pytest.mark.parametrize("text", [
+    "Morning or afternoon, either works",
+    "Can we meet next week?",
+    "",
+    "Tuesday would be great",
+])
+def test_ambiguous_or_absent_time_of_day_infers_nothing(text):
+    from agent.scheduling import infer_time_of_day
+    assert infer_time_of_day(text) is None
+
+
+def test_inferred_afternoon_actually_filters_the_offers():
+    from agent.scheduling import infer_time_of_day
+    inferred = infer_time_of_day("45 minutes on a Tuesday afternoon please")
+    prefs = normalise_preferences(
+        {"duration": 45, "day_preference": "tuesday", "time_of_day": inferred}
+    )
+    slots = find_available_slots([], prefs, MONDAY_8AM, POLICY)
+    assert slots
+    assert all(s.start.hour >= 12 for s in slots)

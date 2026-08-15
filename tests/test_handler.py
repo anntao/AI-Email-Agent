@@ -492,3 +492,41 @@ def test_seconds_are_never_carried_through():
 
 def test_unparsable_time_returns_none():
     assert _resolve("whenever suits you") is None
+
+
+# ---------- time-of-day backstop ----------
+
+
+def test_a_stated_afternoon_survives_the_model_omitting_it(monkeypatch, wired):
+    """Regression: "Tuesday afternoon" offered a 10:00 slot because the field was empty."""
+    ctx = wired["ctx"]
+    wired["message"] = make_message(text="Could we find 45 minutes on a Tuesday afternoon?")
+    set_intent(monkeypatch, Intent.INITIAL_REQUEST, {"duration": 45, "day_preference": "tuesday"})
+
+    handler.process_message(ctx, "msg1")
+
+    offered = scheduling.parse_offered_slots(wired["sent"][0]["raw"], ET)
+    assert offered
+    assert all(s.start.hour >= 12 for s in offered)
+
+
+def test_the_model_value_wins_over_inference(monkeypatch, wired):
+    ctx = wired["ctx"]
+    wired["message"] = make_message(text="Tuesday afternoon would be ideal")
+    set_intent(monkeypatch, Intent.INITIAL_REQUEST, {"time_of_day": "morning"})
+
+    handler.process_message(ctx, "msg1")
+
+    offered = scheduling.parse_offered_slots(wired["sent"][0]["raw"], ET)
+    assert offered and all(s.start.hour < 12 for s in offered)
+
+
+def test_inference_does_not_run_for_confirmations(monkeypatch, wired):
+    ctx = wired["ctx"]
+    offered_at = NOW.replace(hour=14, minute=0)
+    wired["message"] = make_message(
+        text="Yes, that afternoon slot works", html=offered_html(offered_at)
+    )
+    set_intent(monkeypatch, Intent.CONFIRMATION,
+               {"confirmed_start_time_iso": offered_at.isoformat()})
+    assert "booked" in handler.process_message(ctx, "msg1")
