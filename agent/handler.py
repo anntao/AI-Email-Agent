@@ -152,7 +152,9 @@ def _process(ctx: Context, message_id: str) -> tuple[str, bool]:
         timezone_name=settings.tzname,
     )
     if result.intent is Intent.ERROR:
-        if "not configured" in (result.error or ""):
+        # A misconfigured request (bad schema, retired model, missing key) fails
+        # identically on every redelivery, so it must not be retried.
+        if not result.retryable:
             raise RuntimeError(f"Intent classification unavailable: {result.error}")
         raise RetryableError(f"Intent classification failed: {result.error}")
 

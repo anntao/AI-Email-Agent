@@ -72,7 +72,7 @@ class Settings:
     work_start: dtime = dtime(9, 30)
     work_end: dtime = dtime(18, 0)
 
-    model: str = "gemini-2.5-flash"
+    model: str = "gemini-3.7-flash"
     pubsub_topic: str = "gmail-new-email"
 
     search_horizon_days: int = 14
@@ -122,7 +122,7 @@ def load(project_id: str) -> Settings:
             timezone_label=os.environ.get("AGENT_TIMEZONE_LABEL", "ET"),
             work_start=_env_time("WORK_START", "09:30"),
             work_end=_env_time("WORK_END", "18:00"),
-            model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+            model=os.environ.get("GEMINI_MODEL", "gemini-3.7-flash"),
             pubsub_topic=os.environ.get("GMAIL_PUBSUB_TOPIC", "gmail-new-email"),
             search_horizon_days=_env_int("SEARCH_HORIZON_DAYS", 14),
             max_days_offered=_env_int("MAX_DAYS_OFFERED", 3),

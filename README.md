@@ -174,7 +174,7 @@ the daily Cloud Scheduler job renews it.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `GEMINI_API_KEY` | — | Gemini API key |
-| `GEMINI_MODEL` | `gemini-2.5-flash` | Model for intent classification |
+| `GEMINI_MODEL` | `gemini-3.7-flash` | Model for intent classification |
 | `AGENT_TIMEZONE` | `America/New_York` | IANA timezone for all scheduling |
 | `AGENT_TIMEZONE_LABEL` | `ET` | Label shown in emails |
 | `WORK_START` / `WORK_END` | `09:30` / `18:00` | Working day bounds |

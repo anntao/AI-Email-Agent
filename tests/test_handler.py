@@ -384,7 +384,7 @@ def test_day_with_no_offered_slots_searches_that_day(monkeypatch, wired):
 def test_a_model_failure_is_retryable_not_a_silent_success(monkeypatch, wired):
     ctx = wired["ctx"]
     monkeypatch.setattr(
-        handler, "classify", lambda *a, **k: IntentResult(Intent.ERROR, {}, "503 unavailable")
+        handler, "classify", lambda *a, **k: IntentResult(Intent.ERROR, {}, "503 unavailable", retryable=True)
     )
 
     with pytest.raises(RetryableError):
@@ -394,11 +394,11 @@ def test_a_model_failure_is_retryable_not_a_silent_success(monkeypatch, wired):
     assert wired["read"] == []
 
 
-def test_a_missing_api_key_is_permanent_not_retried_forever(monkeypatch, wired):
+def test_a_permanent_api_error_is_not_retried_forever(monkeypatch, wired):
     ctx = wired["ctx"]
     monkeypatch.setattr(
         handler, "classify",
-        lambda *a, **k: IntentResult(Intent.ERROR, {}, "GEMINI_API_KEY is not configured"),
+        lambda *a, **k: IntentResult(Intent.ERROR, {}, "400 INVALID_ARGUMENT: bad schema", retryable=False),
     )
 
     outcome = handler.process_message(ctx, "msg1")

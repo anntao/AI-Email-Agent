@@ -38,7 +38,9 @@ RESPONSE_SCHEMA = {
         "reasoning": {"type": "STRING"},
         "confirmed_start_time_iso": {"type": "STRING"},
         "day_name": {"type": "STRING"},
-        "time_of_day": {"type": "STRING", "enum": ["morning", "afternoon", "evening", ""]},
+        # No empty string in the enum: the API rejects empty enum values outright.
+        # time_of_day is not in `required`, so the model omits it when unstated.
+        "time_of_day": {"type": "STRING", "enum": ["morning", "afternoon", "evening"]},
         "duration": {"type": "INTEGER"},
         "day_preference": {"type": "STRING"},
         "start_date": {"type": "STRING"},
@@ -81,10 +83,34 @@ class IntentResult:
     intent: Intent
     data: dict[str, Any]
     error: Optional[str] = None
+    retryable: bool = False
 
     @property
     def ok(self) -> bool:
         return self.intent is not Intent.ERROR
+
+
+# 4xx means the request itself is wrong, so redelivering it produces the same
+# failure forever. The two exceptions are timeouts and quota, which do clear.
+RETRYABLE_CLIENT_CODES = {408, 429}
+
+
+def _is_retryable(exc: Exception) -> bool:
+    code = getattr(exc, "code", None)
+    if code is None:
+        status = str(getattr(exc, "status", "") or "")
+        if "RESOURCE_EXHAUSTED" in status or "UNAVAILABLE" in status:
+            return True
+        if "INVALID_ARGUMENT" in status or "NOT_FOUND" in status:
+            return False
+        return True
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        return True
+    if 400 <= code < 500:
+        return code in RETRYABLE_CLIENT_CODES
+    return True
 
 
 _client: Optional[genai.Client] = None
@@ -107,12 +133,12 @@ def classify(
     now: datetime,
     *,
     api_key: Optional[str],
-    model: str = "gemini-2.5-flash",
+    model: str = "gemini-3.7-flash",
     timezone_name: str = "America/New_York",
 ) -> IntentResult:
     """Classify a thread. Returns Intent.ERROR rather than raising."""
     if not api_key:
-        return IntentResult(Intent.ERROR, {}, "GEMINI_API_KEY is not configured")
+        return IntentResult(Intent.ERROR, {}, "GEMINI_API_KEY is not configured", retryable=False)
 
     prompt = (
         f"Current date and time: {now.isoformat()} ({timezone_name}).\n"
@@ -133,11 +159,12 @@ def classify(
         )
         payload = json.loads(response.text)
     except Exception as exc:  # noqa: BLE001 - caller decides whether to retry
-        log.warning("Intent classification failed: %s", exc)
-        return IntentResult(Intent.ERROR, {}, str(exc))
+        retryable = _is_retryable(exc)
+        log.warning("Intent classification failed (retryable=%s): %s", retryable, exc)
+        return IntentResult(Intent.ERROR, {}, str(exc), retryable=retryable)
 
     if not isinstance(payload, dict):
-        return IntentResult(Intent.ERROR, {}, f"unexpected payload type {type(payload).__name__}")
+        return IntentResult(Intent.ERROR, {}, f"unexpected payload type {type(payload).__name__}", retryable=True)
 
     raw_intent = str(payload.get("intent", "")).strip().upper()
     try:
