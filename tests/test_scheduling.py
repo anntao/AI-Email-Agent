@@ -41,9 +41,11 @@ def test_day_periods_start_at_configured_work_start_not_nine():
     assert periods[0][0].time() == dtime(9, 30)
 
 
-def test_first_offer_of_the_day_respects_work_start():
+def test_every_offer_sits_inside_the_working_day():
     slots = find_available_slots([], Preferences(), MONDAY_8AM, POLICY)
-    assert slots[0].start.time() == dtime(9, 30)
+    assert slots
+    assert all(s.start.time() >= dtime(9, 30) for s in slots)
+    assert all(s.end.time() <= dtime(18, 0) for s in slots)
 
 
 def test_custom_work_hours_are_honoured():
@@ -72,13 +74,62 @@ def test_busy_intervals_are_skipped():
     assert all(s.start >= at(0, 13, 0) for s in today)
 
 
-def test_a_slot_is_offered_immediately_after_a_busy_block_ends():
-    busy = [Interval(at(0, 9, 0), at(0, 13, 0))]
+# ---------- spreading offers across the day ----------
+
+
+def test_offers_are_spread_across_the_day_not_clustered():
+    """An open calendar used to yield the first slot of each window, every time."""
     today = [
-        s for s in find_available_slots(busy, Preferences(), MONDAY_8AM, POLICY)
+        s for s in find_available_slots([], Preferences(), MONDAY_8AM, POLICY)
         if s.start.date() == MONDAY_8AM.date()
     ]
-    assert today[0].start == at(0, 13, 0)
+    hours = [s.start.hour for s in today]
+    assert len(set(hours)) == len(hours)
+    assert max(hours) - min(hours) >= 4  # genuinely spread, not three near-identical times
+
+
+def test_the_offered_days_are_not_identical_to_each_other():
+    slots = find_available_slots([], Preferences(), MONDAY_8AM, POLICY)
+    by_day = {}
+    for s in slots:
+        by_day.setdefault(s.start.date(), []).append(s.start.strftime("%H:%M"))
+    shapes = {tuple(v) for v in by_day.values()}
+    assert len(by_day) == 3
+    assert len(shapes) > 1, "every day offered exactly the same times"
+
+
+def test_the_same_calendar_always_produces_the_same_offer():
+    a = find_available_slots([], Preferences(), MONDAY_8AM, POLICY)
+    b = find_available_slots([], Preferences(), MONDAY_8AM, POLICY)
+    assert [s.start for s in a] == [s.start for s in b]
+
+
+def test_spread_returns_everything_when_there_is_little_to_choose_from():
+    from agent.scheduling import spread
+    assert spread([1, 2], 3) == [1, 2]
+    assert spread([], 3) == []
+    assert spread([1, 2, 3], 0) == []
+
+
+def test_spread_never_repeats_an_item():
+    from agent.scheduling import spread
+    for phase in (0.0, 0.35, 0.5, 0.65, 0.99):
+        picked = spread(list(range(20)), 5, phase)
+        assert len(picked) == len(set(picked))
+
+
+def test_spread_stays_in_range():
+    from agent.scheduling import spread
+    items = list(range(7))
+    for phase in (0.0, 0.5, 0.99):
+        assert all(x in items for x in spread(items, 3, phase))
+
+
+def test_a_long_meeting_may_straddle_a_period_boundary():
+    """The union window lets a 60-minute slot cross the 12:00 line."""
+    from agent.scheduling import free_starts
+    starts = free_starts(MONDAY_8AM.date(), [], 60, MONDAY_8AM, POLICY, None)
+    assert any(s.hour == 11 and s.minute == 30 for s in starts)
 
 
 def test_weekends_are_never_offered():

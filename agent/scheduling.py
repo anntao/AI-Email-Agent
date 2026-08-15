@@ -260,6 +260,70 @@ def conflicts(start: datetime, end: datetime, busy: Iterable[Interval]) -> bool:
     return any(interval.overlaps(start, end) for interval in busy)
 
 
+def search_window(day: date, policy: SlotPolicy, time_of_day: Optional[str]):
+    """The contiguous stretch of the day to draw offers from.
+
+    Taking the union of the selected periods rather than each period separately
+    lets a meeting straddle a boundary — a 60-minute slot at 11:30 spans the
+    morning/afternoon line and would otherwise never be offered.
+    """
+    selected = _select_periods(day_periods(day, policy), time_of_day)
+    if not selected:
+        return None
+    return selected[0][0], selected[-1][1]
+
+
+# Sampling phase per offered day, so the days are not carbon copies of each
+# other. Three days of identical times is what made a sender name a time that
+# had never been offered.
+DAY_PHASES = (0.35, 0.5, 0.65)
+
+
+def spread(items: list, count: int, phase: float = 0.5) -> list:
+    """Pick `count` items spaced evenly through the list, avoiding the extremes.
+
+    Offering the first free slot in each window meant an open calendar always
+    produced the same three times, so a sender naturally proposed something that
+    had never been offered. Sampling within equal buckets gives a spread across
+    the day; `phase` shifts where inside each bucket the pick lands, and stays
+    deterministic so the same calendar always yields the same offer.
+    """
+    if count <= 0 or not items:
+        return []
+    if len(items) <= count:
+        return list(items)
+    picked: list = []
+    for i in range(count):
+        index = min(len(items) - 1, int(round((i + phase) * len(items) / count)))
+        candidate = items[index]
+        if candidate not in picked:
+            picked.append(candidate)
+    return picked
+
+
+def free_starts(
+    day: date,
+    busy: list[Interval],
+    duration: int,
+    earliest: datetime,
+    policy: SlotPolicy,
+    time_of_day: Optional[str],
+) -> list[datetime]:
+    """Every start time on the step grid that fits and is free, for one day."""
+    window = search_window(day, policy, time_of_day)
+    if window is None:
+        return []
+    window_start, window_end = window
+
+    cursor = _round_up(max(window_start, earliest), policy.step_minutes)
+    starts: list[datetime] = []
+    while cursor + timedelta(minutes=duration) <= window_end:
+        if not conflicts(cursor, cursor + timedelta(minutes=duration), busy):
+            starts.append(cursor)
+        cursor += timedelta(minutes=policy.step_minutes)
+    return starts
+
+
 def find_available_slots(
     busy: Iterable[Interval],
     preferences: Preferences,
@@ -290,23 +354,13 @@ def find_available_slots(
         if target_weekday is not None and day.weekday() != target_weekday:
             continue
 
-        found_today = 0
-        for period_start, period_end in _select_periods(
-            day_periods(day, policy), preferences.time_of_day
-        ):
-            if found_today >= policy.per_day:
-                break
-            cursor = _round_up(max(period_start, earliest), policy.step_minutes)
-            while cursor + timedelta(minutes=duration) <= period_end:
-                end = cursor + timedelta(minutes=duration)
-                if not conflicts(cursor, end, busy):
-                    slots.append(Slot(cursor, duration))
-                    found_today += 1
-                    break
-                cursor += timedelta(minutes=policy.step_minutes)
+        starts = free_starts(day, busy, duration, earliest, policy, preferences.time_of_day)
+        if not starts:
+            continue
 
-        if found_today:
-            days_used += 1
+        phase = DAY_PHASES[days_used % len(DAY_PHASES)]
+        slots.extend(Slot(start, duration) for start in spread(starts, policy.per_day, phase))
+        days_used += 1
 
     return slots
 
