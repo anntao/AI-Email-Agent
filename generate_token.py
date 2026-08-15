@@ -1,87 +1,89 @@
 #!/usr/bin/env python3
-"""
-Gmail OAuth Token Generator for AI Email Agent
-This script helps generate a fresh OAuth token for the Gmail API.
+"""Generate the OAuth token that the agent stores in Secret Manager.
+
+Run this from the agent's Google account, not the owner's.
+
+The scopes here are narrower than the original https://mail.google.com/ grant,
+so an existing token will NOT satisfy them — you have to re-run this once after
+upgrading and upload the result as a new version of the agent-token-json secret.
 """
 
-import os
+import argparse
 import json
+import os
+import subprocess
+import sys
+
 from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
 
-# Gmail API scopes
-SCOPES = ['https://mail.google.com/', 'https://www.googleapis.com/auth/calendar']
+from agent.config import SCOPES, TOKEN_SECRET_ID
 
-def generate_token():
-    """Generate a fresh OAuth token for Gmail API."""
-    
-    creds = None
-    
-    # Check if token.json exists
-    if os.path.exists('token.json'):
-        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
-    
-    # If there are no (valid) credentials available, let the user log in
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-                print("Token refreshed successfully!")
-            except Exception as e:
-                print(f"Token refresh failed: {e}")
-                print("Generating new token...")
-                creds = None
-        
-        if not creds:
-            # You'll need to download the client configuration file from Google Cloud Console
-            # and save it as 'credentials.json' in the same directory as this script
-            if not os.path.exists('credentials.json'):
-                print("ERROR: credentials.json not found!")
-                print("Please download your OAuth 2.0 client configuration from Google Cloud Console")
-                print("and save it as 'credentials.json' in this directory.")
-                return None
-            
-            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
-            creds = flow.run_local_server(port=0)
-        
-        # Save the credentials for the next run
-        with open('token.json', 'w') as token:
-            token.write(creds.to_json())
-    
-    # Convert to the format expected by Secret Manager
-    token_data = {
-        'token': creds.token,
-        'refresh_token': creds.refresh_token,
-        'token_uri': creds.token_uri,
-        'client_id': creds.client_id,
-        'client_secret': creds.client_secret,
-        'scopes': creds.scopes
+CLIENT_SECRETS = "credentials.json"
+
+
+def generate(client_secrets: str) -> dict:
+    if not os.path.exists(client_secrets):
+        sys.exit(
+            f"ERROR: {client_secrets} not found.\n"
+            "Download the OAuth 2.0 Desktop client config from Google Cloud Console "
+            f"(APIs & Services > Credentials) and save it as {client_secrets}."
+        )
+
+    flow = InstalledAppFlow.from_client_secrets_file(client_secrets, SCOPES)
+    # prompt='consent' forces a refresh token even if this account has authorised
+    # the app before. Without it, a re-run can return a token that cannot refresh.
+    creds = flow.run_local_server(port=0, prompt="consent", access_type="offline")
+
+    if not creds.refresh_token:
+        sys.exit("ERROR: Google did not return a refresh token. Revoke the app's access "
+                 "at https://myaccount.google.com/permissions and run this again.")
+
+    return {
+        "token": creds.token,
+        "refresh_token": creds.refresh_token,
+        "token_uri": creds.token_uri,
+        "client_id": creds.client_id,
+        "client_secret": creds.client_secret,
+        "scopes": list(creds.scopes or SCOPES),
     }
-    
-    print("Token generated successfully!")
-    print(f"Token expires at: {creds.expiry}")
-    print("\nToken data for Secret Manager:")
-    print(json.dumps(token_data, indent=2))
-    
-    return token_data
 
-if __name__ == '__main__':
-    print("Gmail OAuth Token Generator")
-    print("=" * 30)
-    print("This script will help you generate a fresh OAuth token for the Gmail API.")
-    print("Make sure you have downloaded your OAuth 2.0 client configuration")
-    print("from Google Cloud Console and saved it as 'credentials.json'")
-    print()
-    
-    token_data = generate_token()
-    
-    if token_data:
-        print("\n" + "=" * 50)
-        print("NEXT STEPS:")
-        print("1. Copy the JSON output above")
-        print("2. Go to Google Cloud Console → Secret Manager")
-        print("3. Find the 'agent-token-json' secret")
-        print("4. Create a new version with the JSON data above")
-        print("5. Deploy the updated code to Cloud Run")
-        print("=" * 50) 
+
+def upload(project_id: str, payload: dict) -> None:
+    process = subprocess.run(
+        ["gcloud", "secrets", "versions", "add", TOKEN_SECRET_ID,
+         f"--project={project_id}", "--data-file=-"],
+        input=json.dumps(payload).encode(),
+        capture_output=True,
+    )
+    if process.returncode != 0:
+        sys.exit(f"gcloud failed: {process.stderr.decode().strip()}")
+    print(f"Uploaded a new version of {TOKEN_SECRET_ID} to project {project_id}.")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--client-secrets", default=CLIENT_SECRETS)
+    parser.add_argument("--project", help="Upload straight to this project's Secret Manager")
+    parser.add_argument("--print", action="store_true", dest="show",
+                        help="Print the token JSON to stdout (contains a refresh token)")
+    args = parser.parse_args()
+
+    print("Requesting scopes:\n  " + "\n  ".join(SCOPES) + "\n")
+    payload = generate(args.client_secrets)
+
+    if args.project:
+        upload(args.project, payload)
+    elif args.show:
+        print(json.dumps(payload, indent=2))
+    else:
+        with open("token.json", "w") as handle:
+            json.dump(payload, handle, indent=2)
+        print("Wrote token.json (gitignored).")
+        print(f"Upload it with:\n  gcloud secrets versions add {TOKEN_SECRET_ID} "
+              "--data-file=token.json")
+
+    print("\nAfter uploading, redeploy so the service picks up the new token.")
+
+
+if __name__ == "__main__":
+    main()
