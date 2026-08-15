@@ -26,11 +26,18 @@ A message is acted on only when all of these hold:
 
 1. The agent's address is in **To or Cc** — being named in a forwarded body is not
    an invitation.
-2. The owner is a **genuine parsed participant** of the thread.
+2. The owner has **sent into the thread** themselves, or the agent is already
+   engaged on it. Being CC'd is not the same as asking: without this, anyone who
+   emails the agent and copies the owner gets the owner's free/busy times back.
 3. The sender passes the **allowlist**, if the `allowed-senders` secret exists.
 4. The sender is under the **hourly rate limit**.
 
 Anything else is left alone entirely — not replied to, not marked read.
+
+Rule 2 means the owner starts the conversation — emailing the other party and
+copying the agent — after which replies from everyone else on the thread are
+handled normally, so a negotiation still runs end to end. Set
+`REQUIRE_OWNER_SENDER=false` to allow anyone to invoke the agent instead.
 
 ## Intents
 
@@ -184,6 +191,7 @@ the daily Cloud Scheduler job renews it.
 | `DEFAULT_DURATION_MINUTES` | `30` | Used when none is stated |
 | `MAX_THREAD_CHARS` | `20000` | Cap on text sent to the model |
 | `SENDER_HOURLY_LIMIT` | `12` | Requests per sender per hour |
+| `REQUIRE_OWNER_SENDER` | `true` | Only engage threads the owner has sent in |
 | `PUSH_SERVICE_ACCOUNT` | — | Required caller identity for POST routes |
 | `PUSH_AUDIENCE` | — | Expected OIDC audience, if you set one |
 | `ALLOW_UNAUTHENTICATED_PUSH` | unset | Escape hatch; logs a warning. Do not leave on |

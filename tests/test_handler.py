@@ -99,6 +99,21 @@ def make_message(**overrides) -> ParsedMessage:
     )
 
 
+def agent_reply(**overrides) -> ParsedMessage:
+    headers = {"from": f"Assistant <{AGENT}>", "to": GUEST, "cc": OWNER,
+               "x-agent-processed": "true", "subject": "Re: Intro chat"}
+    headers.update(overrides.pop("headers", {}))
+    return ParsedMessage(id="prev", thread_id="thread1", headers=headers, text="", html="")
+
+
+def owner_message(**overrides) -> ParsedMessage:
+    headers = {"from": f"Alex <{OWNER}>", "to": f"{GUEST}, {AGENT}", "cc": "",
+               "subject": "Intro chat"}
+    headers.update(overrides.pop("headers", {}))
+    return ParsedMessage(id="prev", thread_id="thread1", headers=headers,
+                         text="Can you find us a time?", html="")
+
+
 @pytest.fixture
 def ctx():
     context = Context(settings=make_settings(), store=FakeStore(), gmail=object(), calendar=object())
@@ -112,7 +127,8 @@ def wired(monkeypatch, ctx):
     calls = {"sent": [], "events": [], "read": [], "free": True, "busy": []}
 
     monkeypatch.setattr(mailbox, "get_message", lambda g, mid: calls["message"])
-    monkeypatch.setattr(mailbox, "get_thread", lambda g, tid: [calls["message"]])
+    # Default: a thread the owner already started, which is the normal case.
+    monkeypatch.setattr(mailbox, "get_thread", lambda g, tid: [owner_message(), calls["message"]])
     monkeypatch.setattr(mailbox, "mark_read", lambda g, mid: calls["read"].append(mid))
     monkeypatch.setattr(mailbox, "send", lambda g, body, thread_id=None: calls["sent"].append(body))
     monkeypatch.setattr(
@@ -530,3 +546,66 @@ def test_inference_does_not_run_for_confirmations(monkeypatch, wired):
     set_intent(monkeypatch, Intent.CONFIRMATION,
                {"confirmed_start_time_iso": offered_at.isoformat()})
     assert "booked" in handler.process_message(ctx, "msg1")
+
+
+# ---------- the owner must engage the thread (availability leak) ----------
+
+
+def test_a_stranger_ccing_the_owner_gets_nothing(monkeypatch, wired):
+    """The availability leak: being copied in is not the same as being asked."""
+    ctx = wired["ctx"]
+    set_intent(monkeypatch, Intent.INITIAL_REQUEST)
+    # thread contains only the stranger's message
+    monkeypatch.setattr(mailbox, "get_thread", lambda g, t: [wired["message"]])
+
+    outcome = handler.process_message(ctx, "msg1")
+
+    assert "has not sent in this thread" in outcome
+    assert wired["sent"] == []
+    assert wired["read"] == []
+
+
+def test_the_owner_can_start_a_thread(monkeypatch, wired):
+    ctx = wired["ctx"]
+    wired["message"] = owner_message(id="msg1")
+    monkeypatch.setattr(mailbox, "get_thread", lambda g, t: [wired["message"]])
+    set_intent(monkeypatch, Intent.INITIAL_REQUEST)
+
+    assert "offered" in handler.process_message(ctx, "msg1")
+
+
+def test_a_guest_reply_is_handled_once_the_owner_started_it(monkeypatch, wired):
+    """A negotiation must still work: the counterparty replies, the agent acts."""
+    ctx = wired["ctx"]
+    monkeypatch.setattr(mailbox, "get_thread", lambda g, t: [owner_message(), wired["message"]])
+    set_intent(monkeypatch, Intent.INITIAL_REQUEST)
+
+    assert "offered" in handler.process_message(ctx, "msg1")
+
+
+def test_a_guest_reply_is_handled_once_the_agent_has_engaged(monkeypatch, wired):
+    ctx = wired["ctx"]
+    monkeypatch.setattr(mailbox, "get_thread", lambda g, t: [agent_reply(), wired["message"]])
+    set_intent(monkeypatch, Intent.INITIAL_REQUEST)
+
+    assert "offered" in handler.process_message(ctx, "msg1")
+
+
+def test_the_gate_can_be_turned_off(monkeypatch, wired):
+    ctx = wired["ctx"]
+    ctx.settings = make_settings(require_owner_sender=False)
+    monkeypatch.setattr(mailbox, "get_thread", lambda g, t: [wired["message"]])
+    set_intent(monkeypatch, Intent.INITIAL_REQUEST)
+
+    assert "offered" in handler.process_message(ctx, "msg1")
+
+
+def test_the_gate_runs_before_any_model_call(monkeypatch, wired):
+    """A blocked thread must not cost a Gemini call."""
+    ctx = wired["ctx"]
+    called = []
+    monkeypatch.setattr(handler, "classify", lambda *a, **k: called.append(1))
+    monkeypatch.setattr(mailbox, "get_thread", lambda g, t: [wired["message"]])
+
+    handler.process_message(ctx, "msg1")
+    assert called == []
