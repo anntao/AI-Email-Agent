@@ -142,6 +142,12 @@ def _process(ctx: Context, message_id: str) -> tuple[str, bool]:
     if not thread:
         thread = [message]
 
+    if settings.require_owner_sender:
+        reason = _owner_engagement_gap(thread, settings)
+        if reason:
+            log.info("Not acting on %s: %s", message_id, reason)
+            return f"ignored ({reason})", False
+
     thread_text = mailbox.build_thread_text(thread, settings.max_thread_chars)
     offered = scheduling.parse_offered_slots(mailbox.thread_html(thread), ctx.tz)
     log.info("Thread %s: %d chars, %d previously offered slots",
@@ -179,6 +185,23 @@ def _process(ctx: Context, message_id: str) -> tuple[str, bool]:
         return _handle_day_confirmation(ctx, message, offered, result), True
 
     return _propose(ctx, message, result, alternative=result.intent is Intent.OTHER), True
+
+
+def _owner_engagement_gap(thread: list[ParsedMessage], settings: Settings) -> Optional[str]:
+    """Why this thread is not the owner's to act on, or None if it is.
+
+    Being CC'd is not the same as asking. Without this, anyone who emails the
+    agent and copies the owner gets the owner's free/busy times back. The agent
+    engages only once the owner has sent into the thread themselves — after
+    which replies from everyone else are handled as normal, so a negotiation
+    still works end to end.
+    """
+    for message in thread:
+        if message.is_agent_sent:
+            return None  # the agent is already engaged on this thread
+        if addresses.sender_address(message.header("from")) == settings.owner_email:
+            return None
+    return f"owner {settings.owner_email} has not sent in this thread"
 
 
 # ---------- intent handlers ----------

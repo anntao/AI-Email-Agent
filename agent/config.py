@@ -87,6 +87,9 @@ class Settings:
     sender_hourly_limit: int = 12
     stale_claim_seconds: int = 600
 
+    # When true, the agent only engages a thread the owner has sent in.
+    require_owner_sender: bool = True
+
     @property
     def tzname(self) -> str:
         return str(self.timezone)
@@ -131,6 +134,7 @@ def load(project_id: str) -> Settings:
             max_thread_chars=_env_int("MAX_THREAD_CHARS", 20000),
             max_messages_per_notification=_env_int("MAX_MESSAGES_PER_NOTIFICATION", 10),
             sender_hourly_limit=_env_int("SENDER_HOURLY_LIMIT", 12),
+            require_owner_sender=_env_flag("REQUIRE_OWNER_SENDER", True),
         )
         return _settings
 
