@@ -257,14 +257,55 @@ def _slots_for(ctx: Context, prefs: Preferences, alt_tz: Optional[ZoneInfo]) -> 
 def _parse_specific_time(
     prefs: Preferences, tz: ZoneInfo, alt_tz: Optional[ZoneInfo], now: datetime
 ) -> Optional[datetime]:
-    try:
-        parsed = dtparser.parse(prefs.specific_time, default=now.replace(tzinfo=None))
-    except (ValueError, OverflowError, TypeError) as exc:
-        log.info("Could not parse specific_time %r: %s", prefs.specific_time, exc)
+    """Resolve a proposed time to a real datetime.
+
+    The model often returns a bare clock time ("2:00 PM") even when the message
+    said "Tuesday at 2pm", because the day travelled in day_preference instead.
+    dateutil then fills the date from its default, so the proposal silently
+    became *today* — which on a weekend was rejected as outside working hours
+    and the stated preference was lost entirely.
+    """
+    raw = prefs.specific_time
+    if not raw:
         return None
+
+    base = now.astimezone(tz).replace(tzinfo=None, second=0, microsecond=0)
+    try:
+        parsed = dtparser.parse(raw, default=base)
+        # Parsing again against a different default reveals whether the string
+        # carried a date of its own: if it did, both results agree.
+        probe = dtparser.parse(raw, default=base + timedelta(days=1))
+    except (ValueError, OverflowError, TypeError) as exc:
+        log.info("Could not parse specific_time %r: %s", raw, exc)
+        return None
+
+    if parsed.date() != probe.date():
+        parsed = parsed.replace(tzinfo=None)
+        target = _target_date(prefs, base)
+        if target is not None:
+            parsed = datetime.combine(target, parsed.time())
+
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=alt_tz or tz)
-    return parsed.astimezone(tz)
+    resolved = parsed.astimezone(tz).replace(second=0, microsecond=0)
+
+    # A bare time that has already passed today means the next occurrence.
+    if resolved <= now:
+        weekday = scheduling.WEEKDAYS.get(prefs.day_preference or "")
+        resolved += timedelta(days=7 if weekday is not None else 1)
+
+    return resolved
+
+
+def _target_date(prefs: Preferences, base: datetime):
+    """The date a dateless time refers to, from start_date or a named weekday."""
+    if prefs.start_date and prefs.start_date >= base.date():
+        return prefs.start_date
+    weekday = scheduling.WEEKDAYS.get(prefs.day_preference or "")
+    if weekday is None:
+        return None
+    ahead = (weekday - base.date().weekday()) % 7
+    return base.date() + timedelta(days=ahead)
 
 
 def _handle_confirmation(

@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from agent import calendar_ops, handler, mailbox
+from agent import calendar_ops, handler, mailbox, scheduling
 from agent.config import Settings
 from agent.handler import Context, RetryableError
 from agent.intent import Intent, IntentResult
@@ -442,3 +442,53 @@ def test_every_new_message_is_processed_not_just_the_newest(monkeypatch, ctx):
 
     assert outcomes == ["a: done", "b: done", "c: done"]
     assert ctx.store.cursor == "9"
+
+
+# ---------- proposed-time resolution ----------
+
+
+def _resolve(specific_time, **kw):
+    from agent.handler import _parse_specific_time
+    prefs = scheduling.Preferences(specific_time=specific_time, **kw)
+    return _parse_specific_time(prefs, ET, None, NOW)
+
+
+def test_bare_time_with_a_named_day_lands_on_that_day():
+    """Regression: "Tuesday at 2pm" resolved to today, a Saturday, and was dropped."""
+    got = _resolve("2:00 pm", day_preference="tuesday")
+    assert got.weekday() == 1
+    assert (got.hour, got.minute) == (14, 0)
+    assert got.date() == NOW.date() + timedelta(days=1)  # NOW is a Monday
+
+
+def test_bare_time_uses_start_date_when_given():
+    target = (NOW + timedelta(days=5)).date()
+    got = _resolve("9:30 am", start_date=target)
+    assert got.date() == target
+    assert (got.hour, got.minute) == (9, 30)
+
+
+def test_explicit_date_in_the_string_wins():
+    got = _resolve("2026-03-04T16:00:00-05:00", day_preference="tuesday")
+    assert got.date().isoformat() == "2026-03-04"
+    assert got.hour == 16
+
+
+def test_bare_time_already_past_today_moves_forward():
+    got = _resolve("8:00 am")  # NOW is 09:00
+    assert got > NOW
+
+
+def test_bare_time_with_no_day_context_stays_today():
+    got = _resolve("2:00 pm")
+    assert got.date() == NOW.date()
+    assert got.hour == 14
+
+
+def test_seconds_are_never_carried_through():
+    got = _resolve("2:00 pm", day_preference="wednesday")
+    assert got.second == 0 and got.microsecond == 0
+
+
+def test_unparsable_time_returns_none():
+    assert _resolve("whenever suits you") is None

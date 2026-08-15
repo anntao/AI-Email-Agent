@@ -68,7 +68,10 @@ Intents:
   Give day_name, and time_of_day if stated.
 - OTHER: still negotiating — none of the times work, or a new time is proposed.
   Fill in whatever new preferences are stated, including specific_time and
-  time_zone if the message names a city or zone.
+  time_zone if the message names a city or zone. specific_time must be a full
+  ISO 8601 datetime with the date included, resolved against the current date —
+  never a bare clock time. If the message says "Tuesday at 2pm", that is
+  specific_time "2026-01-06T14:00:00-05:00", not "2:00 PM".
 - IGNORE: the thread has moved past finding a time (agenda, logistics, small
   talk, or anything unrelated to scheduling).
 
