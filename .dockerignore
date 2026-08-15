@@ -1,0 +1,8 @@
+.venv/
+.git/
+tests/
+__pycache__/
+*.pyc
+.pytest_cache/
+token.json
+credentials.json

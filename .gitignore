@@ -1,19 +1,22 @@
-# Credentials and Tokens
+# Credentials and tokens — never commit these
 token.json
 credentials.json
 client_secret*.json
 oauth*.json
+*.pem
 
-# Python cache and virtual environments
+# Python
 __pycache__/
-*.pyc
-.env
+*.py[cod]
+.pytest_cache/
+.venv/
 venv/
 env/
+.env
 
-# Google Cloud specific files
+# Google Cloud
 .gcloud/
 
-# OS specific files
+# OS
 .DS_Store
 Thumbs.db

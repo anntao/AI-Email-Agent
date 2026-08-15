@@ -1,1229 +1,180 @@
-# main.py
-# This is the production code for your Cloud Run service.
-# Version: 2025-07-17 - Added debugging for hidden data extraction
+"""Cloud Run entrypoint for the email scheduling agent.
 
-import os
+Routes:
+  POST /       Pub/Sub push target for Gmail notifications
+  POST /ping   Cloud Scheduler target that renews the Gmail watch
+  GET  /health unauthenticated liveness probe
+"""
+
 import base64
-import re
 import json
-from datetime import datetime, timedelta, time
-import pytz
-import google.generativeai as genai
-from flask import Flask, request
-import google.auth
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
-from googleapiclient.discovery import build
-from google.cloud import secretmanager
-from google.cloud import firestore
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-import time as sleep_timer
-import random
-import re
-from dateutil import parser as dtparser
+import logging
+import os
+from typing import Optional
 
-# --- Flask App Initialization ---
+import google.auth
+from flask import Flask, request
+from google.auth.transport import requests as google_requests
+from google.cloud import firestore
+from google.oauth2 import id_token
+
+from agent import auth, config, handler
+from agent.handler import Context, RetryableError
+from agent.store import Store
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("agent.main")
+
 app = Flask(__name__)
 
-# --- Agent Configuration ---
-SCOPES = ['https://mail.google.com/', 'https://www.googleapis.com/auth/calendar']
-ET = pytz.timezone('America/New_York')
-WORK_START_HOUR_ET = 9.5  # 9:30 AM
-WORK_END_HOUR_ET = 18.0   # 6:00 PM
-AGENT_DISPLAY_NAME = "Anntao's AI Assistant"
-
-# --- Helper function to get secrets ---
-def get_secret(project_id, secret_id, version_id="latest"):
-    """Access the Secret Manager API to retrieve a secret."""
-    try:
-        client = secretmanager.SecretManagerServiceClient()
-        name = f"projects/{project_id}/secrets/{secret_id}/versions/{version_id}"
-        response = client.access_secret_version(request={"name": name})
-        return response.payload.data.decode("UTF-8")
-    except Exception as e:
-        print(f"ERROR: Could not access secret: {secret_id}. Error: {e}")
-        return None
-
-def authenticate_with_secrets(project_id):
-    """Authenticates with Google APIs using credentials from Secret Manager."""
-    token_json_str = get_secret(project_id, "agent-token-json")
-    if not token_json_str:
-        print("ERROR: Could not retrieve token from Secret Manager.")
-        return None
-
-    try:
-        creds_info = json.loads(token_json_str)
-        creds = Credentials.from_authorized_user_info(creds_info, SCOPES)
-        if creds.expired and creds.refresh_token:
-            print("Token expired, attempting to refresh...")
-            creds.refresh(Request())
-            print("Token refreshed successfully for this session.")
-            
-            # Update the stored token in Secret Manager with the refreshed token
-            try:
-                updated_token_data = {
-                    'token': creds.token,
-                    'refresh_token': creds.refresh_token,
-                    'token_uri': creds.token_uri,
-                    'client_id': creds.client_id,
-                    'client_secret': creds.client_secret,
-                    'scopes': creds.scopes
-                }
-                
-                # Update the secret in Secret Manager
-                client = secretmanager.SecretManagerServiceClient()
-                secret_name = f"projects/{project_id}/secrets/agent-token-json"
-                secret_version = client.add_secret_version(
-                    request={
-                        "parent": secret_name,
-                        "payload": {"data": json.dumps(updated_token_data).encode("UTF-8")}
-                    }
-                )
-                print(f"Token updated in Secret Manager: {secret_version.name}")
-            except Exception as update_error:
-                print(f"WARNING: Could not update token in Secret Manager: {update_error}")
-                print("Token was refreshed for this session but not saved for future requests.")
-        
-        return creds
-    except Exception as e:
-        print(f"ERROR: Could not load or refresh credentials. Error: {e}")
-        return None
-
-def get_conversation_intent_with_ai(email_thread_text, current_date_et, api_key):
-    """Uses Gemini to determine the overall intent of the email thread."""
-    if not api_key:
-        print("WARN: Gemini API key is not configured. Cannot determine intent.")
-        return {"intent": "error", "data": "API key missing"}
-
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.5-flash') 
-        
-        prompt = f"""
-        Analyze the following email thread to determine the user's current intent. The current date is {current_date_et.strftime('%Y-%m-%d')}.
-
-        There are five possible intents:
-        1. "INITIAL_REQUEST": The user is starting a new request to schedule a meeting. Extract their preferences (duration, day_preference, time_of_day, start_date).
-        2. "CONFIRMATION": The user is replying to confirm a specific time slot that was previously offered. Extract the exact ISO 8601 formatted string of the confirmed time.
-        3. "DAY_CONFIRMATION": The user is confirming a specific day (e.g., "Tuesday works", "Monday is good") but not a specific time. Extract the day name and optionally a time preference.
-        4. "OTHER": The user is negotiating meeting times (e.g., "none of these work", "can you do 4pm Paris?", "I need a different time"). Extract new preferences if present.
-        5. "IGNORE": The conversation has moved beyond scheduling (e.g., discussing meeting agenda, logistics, or other topics unrelated to finding a time). The agent should not respond.
-
-        The agent's previous suggestions are embedded in HTML comments like <!-- data: {{"start": "...", "duration": ...}} -->. Use these to identify if the current email is a reply to suggestions.
-
-        IMPORTANT: 
-        - For CONFIRMATION intent, the confirmed_start_time_iso must be in ISO 8601 format with timezone (e.g., "2024-01-15T14:30:00-05:00" for 2:30 PM ET). 
-        - For DAY_CONFIRMATION intent, return the day name and optionally time_of_day preference.
-        - If the user mentions a time without timezone, assume Eastern Time (ET).
-        - Use IGNORE when the conversation is about meeting details, agenda, logistics, or other non-scheduling topics.
-        - IMPORTANT: If another AI agent or scheduling assistant has offered time slots, you can confirm one of their slots using CONFIRMATION intent.
-        - Look for time slots in the email content, even if they're from other agents or assistants.
-        - CRITICAL: For INITIAL_REQUEST and OTHER intents, pay special attention to future date requests:
-          * If user mentions "next week", calculate the start of next week (Monday) and set start_date to that date in YYYY-MM-DD format
-          * If user mentions specific dates like "August 5th" or "August 5th or 6th", extract the earliest mentioned date as start_date in YYYY-MM-DD format
-          * If user mentions relative dates like "next Monday", "next Tuesday", calculate the actual date and set start_date
-          * For specific dates, assume current year unless explicitly stated otherwise
-
-        Respond with a JSON object with two keys: "intent" and "data".
-        - If intent is "INITIAL_REQUEST", "data" should be a JSON object with scheduling preferences.
-        - If intent is "CONFIRMATION", "data" should be a JSON object with the key "confirmed_start_time_iso" containing the exact time in ISO 8601 format.
-        - If intent is "DAY_CONFIRMATION", "data" should be a JSON object with keys "day_name" (e.g., "tuesday", "monday") and optionally "time_of_day" (e.g., "morning", "afternoon").
-        - If intent is "OTHER", "data" should be a JSON object with new preferences if present.
-        - If intent is "IGNORE", "data" should be null.
-
-        Email Thread:
-        \"\"\"
-        {email_thread_text}
-        \"\"\"
-
-        JSON:
-        """
-        response = model.generate_content(prompt)
-        print(f"AI intent analysis response: {response.text}")
-        json_str = response.text.strip().replace('```json', '').replace('```', '').strip()
-        return json.loads(json_str)
-    except Exception as e:
-        print(f"AI intent analysis failed: {e}")
-        return {"intent": "error", "data": str(e)}
+_project_id: Optional[str] = None
+_db: Optional[firestore.Client] = None
 
 
-def find_available_slots(service, calendar_id, preferences):
-    """Finds available slots based on AI-parsed preferences, skipping weekends."""
-    duration_minutes = preferences.get('duration') or 30
-    day_preference = preferences.get('day_preference')
-    
-    # --- FIX: Handle case where AI returns a list for day_preference ---
-    if isinstance(day_preference, list):
-        day_preference = day_preference[0] if day_preference else None
+def project_id() -> str:
+    global _project_id
+    if _project_id is None:
+        _project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or google.auth.default()[1]
+        if not _project_id:
+            raise RuntimeError("Could not determine the Google Cloud project ID")
+    return _project_id
 
-    time_of_day = preferences.get('time_of_day')
-    start_date_str = preferences.get('start_date')
 
-    now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
-    now_et = now_utc.astimezone(ET)
-    
-    search_start_date_et = now_et
-    if start_date_str:
-        try:
-            parsed_date = datetime.strptime(start_date_str, '%Y-%m-%d')
-            search_start_date_et = ET.localize(parsed_date)
-            print(f"Using AI-provided start_date: {start_date_str} -> {search_start_date_et.strftime('%Y-%m-%d')}")
-        except (ValueError, TypeError):
-            print(f"AI provided an invalid start_date format: {start_date_str}. Using today.")
-    else:
-        print(f"No start_date provided by AI, using today: {search_start_date_et.strftime('%Y-%m-%d')}")
+def db() -> firestore.Client:
+    global _db
+    if _db is None:
+        _db = firestore.Client(project=project_id())
+    return _db
 
-    time_min_utc = search_start_date_et.astimezone(pytz.utc).isoformat()
-    time_max_utc = (search_start_date_et.astimezone(pytz.utc) + timedelta(days=14)).isoformat()
 
-    events_result = service.events().list(calendarId=calendar_id, timeMin=time_min_utc,
-                                          timeMax=time_max_utc, singleEvents=True,
-                                          orderBy='startTime').execute()
-    busy_slots = events_result.get('items', [])
+def build_context() -> Context:
+    settings = config.load(project_id())
+    gmail, calendar = auth.build_services(settings.project_id)
+    return Context(
+        settings=settings,
+        store=Store(db(), stale_claim_seconds=settings.stale_claim_seconds),
+        gmail=gmail,
+        calendar=calendar,
+    )
 
-    available_slots = []
-    found_days = set()
-    
-    # Define time periods for variety
-    morning_start = time(9, 0)   # 9:00 AM
-    morning_end = time(12, 0)    # 12:00 PM
-    early_afternoon_start = time(12, 0)  # 12:00 PM
-    early_afternoon_end = time(15, 0)    # 3:00 PM
-    late_afternoon_start = time(15, 0)   # 3:00 PM
-    late_afternoon_end = time(18, 0)     # 6:00 PM
-    
-    weekday_map = {
-        'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3, 'friday': 4
+
+# ---------- request authentication ----------
+
+
+def _allow_unauthenticated() -> bool:
+    return os.environ.get("ALLOW_UNAUTHENTICATED_PUSH", "").strip().lower() in {
+        "1", "true", "yes", "on",
     }
-    target_weekday = weekday_map.get(day_preference.lower()) if day_preference else None
-    
-    for day_offset in range(14):
-        if len(available_slots) >= 9:  # 3 slots per day, max 3 days
-            break
-            
-        day_to_check_naive = (search_start_date_et + timedelta(days=day_offset)).date()
-        
-        if day_to_check_naive < now_et.date():
-            continue
 
-        if day_to_check_naive.weekday() >= 5: 
-            continue
-            
-        if target_weekday is not None and day_to_check_naive.weekday() != target_weekday:
-            continue
 
-        # Check if we already have 3 slots for this day
-        if day_to_check_naive in found_days:
-            continue
+def verify_caller() -> Optional[str]:
+    """Verify the OIDC token on a push request. Returns an error string, or None if OK.
 
-        # Define the three time periods for this day
-        time_periods = [
-            (ET.localize(datetime.combine(day_to_check_naive, morning_start)), 
-             ET.localize(datetime.combine(day_to_check_naive, morning_end))),
-            (ET.localize(datetime.combine(day_to_check_naive, early_afternoon_start)), 
-             ET.localize(datetime.combine(day_to_check_naive, early_afternoon_end))),
-            (ET.localize(datetime.combine(day_to_check_naive, late_afternoon_start)), 
-             ET.localize(datetime.combine(day_to_check_naive, late_afternoon_end)))
-        ]
-        
-        # If user specified time_of_day preference, filter periods
-        if time_of_day == "morning":
-            time_periods = [time_periods[0]]  # Only morning
-        elif time_of_day == "afternoon":
-            time_periods = time_periods[1:]   # Early and late afternoon
-        
-        day_slots_found = 0
-        for period_start, period_end in time_periods:
-            if day_slots_found >= 3:
-                break
-                
-            # Ensure period doesn't start before now
-            period_start = max(period_start, now_et + timedelta(minutes=5))
-            
-            if period_start + timedelta(minutes=duration_minutes) > period_end:
-                continue
-                
-            current_slot_start_et = period_start
-            
-            while current_slot_start_et + timedelta(minutes=duration_minutes) <= period_end:
-                slot_start_et = current_slot_start_et
-                slot_end_et = slot_start_et + timedelta(minutes=duration_minutes)
-                
-                is_available = True
-                for event in busy_slots:
-                    event_start_str = event['start'].get('dateTime', event['start'].get('date'))
-                    event_end_str = event['end'].get('dateTime', event['end'].get('date'))
-                    if 'T' not in event_start_str: continue 
-                    event_start_utc = datetime.fromisoformat(event_start_str.replace('Z', '+00:00'))
-                    event_end_utc = datetime.fromisoformat(event_end_str.replace('Z', '+00:00'))
-                    if max(slot_start_et.astimezone(pytz.utc), event_start_utc) < min(slot_end_et.astimezone(pytz.utc), event_end_utc):
-                        is_available = False
-                        break
-                
-                if is_available:
-                    available_slots.append({'slot': slot_start_et, 'duration': duration_minutes})
-                    day_slots_found += 1
-                    break  # Found one slot for this period, move to next period
-                
-                current_slot_start_et += timedelta(minutes=30)
-        
-        if day_slots_found > 0:
-            found_days.add(day_to_check_naive)
-            
-    return available_slots[:9]  # Return up to 9 slots (3 per day, max 3 days)
+    Nothing previously authenticated these endpoints; the handler accepted any
+    JSON body with a message.data field. Relying on Cloud Run's --no-allow-
+    unauthenticated alone leaves no defence if that flag is ever changed, so the
+    token is checked here too.
+    """
+    if _allow_unauthenticated():
+        log.warning("ALLOW_UNAUTHENTICATED_PUSH is set; skipping caller verification")
+        return None
 
-def create_threaded_email(sender, to, cc, subject, html_body, in_reply_to, references):
-    """Creates a MIME message that will reply in the same thread."""
-    message = MIMEMultipart('alternative')
-    message['to'] = to
-    # --- PATCH: Set display name in From header ---
-    message['from'] = f"{AGENT_DISPLAY_NAME} <{sender}>"
-    message['cc'] = cc
-    message['subject'] = subject
-    message['In-Reply-To'] = in_reply_to
-    message['References'] = references
-    message['X-Agent-Processed'] = 'true'
-    message.attach(MIMEText(html_body, 'html'))
-    return {'raw': base64.urlsafe_b64encode(message.as_bytes()).decode()}
+    header = request.headers.get("Authorization", "")
+    if not header.startswith("Bearer "):
+        return "missing bearer token"
 
-def send_email(service, user_id, message, thread_id=None):
-  """Send an email message, optionally in a specific thread."""
-  try:
-    if thread_id:
-      message['threadId'] = thread_id
-    sent = (service.users().messages().send(userId=user_id, body=message).execute())
-    return sent
-  except Exception as e:
-    print(f'An error occurred while sending email: {e}')
+    audience = os.environ.get("PUSH_AUDIENCE") or None
+    try:
+        claims = id_token.verify_oauth2_token(
+            header.split(" ", 1)[1], google_requests.Request(), audience
+        )
+    except Exception as exc:  # noqa: BLE001 - any failure is a rejection
+        return f"invalid token: {exc}"
+
+    expected = os.environ.get("PUSH_SERVICE_ACCOUNT")
+    if expected and claims.get("email", "").lower() != expected.lower():
+        return f"unexpected caller {claims.get('email')}"
+    if expected and not claims.get("email_verified", False):
+        return "caller email not verified"
+
     return None
 
-def create_calendar_event(service, calendar_id, summary, start_time_et, duration_minutes, attendees):
-    """Creates an event in the owner's calendar and emails all attendees."""
-    start_utc = start_time_et.astimezone(pytz.utc)
-    end_utc = start_utc + timedelta(minutes=duration_minutes)
-    event = {
-        'summary': summary,
-        'start': {'dateTime': start_utc.isoformat(), 'timeZone': 'America/New_York'},
-        'end': {'dateTime': end_utc.isoformat(), 'timeZone': 'America/New_York'},
-        'attendees': [{'email': email} for email in attendees],
-        'reminders': {'useDefault': True},
-    }
-    created_event = service.events().insert(calendarId=calendar_id, body=event, sendUpdates='all').execute()
-    print(f'Event created: {created_event.get("htmlLink")}')
 
-def get_full_email_body(payload):
-    """
-    Recursively decodes and extracts all plain text and html content from an email payload.
-    This is necessary to find the hidden data comments in replies.
-    """
-    body = ""
-    
-    # Handle multipart messages
-    if 'parts' in payload:
-        for part in payload['parts']:
-            body += get_full_email_body(part)
-    
-    # Handle single part messages
-    elif payload.get('body') and payload['body'].get('data'):
-        data = payload['body']['data']
-        try:
-            decoded = base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')
-            body += decoded
-            print(f"Decoded email part: {len(decoded)} chars")
-        except Exception as e:
-            print(f"Could not decode email part: {e}")
-    
-    # Handle messages with body but no data (sometimes happens)
-    elif payload.get('body') and payload['body'].get('data') is None:
-        print("Email part has body but no data field")
-    
-    # Debug: print payload structure for troubleshooting
-    if not body and 'mimeType' in payload:
-        print(f"Email part MIME type: {payload['mimeType']}")
-    
-    return body
-
-def maybe_refresh_gmail_watch(gmail_service, db, project_id):
-    """Check and refresh Gmail watch if expired or about to expire."""
-    topic_name = f"projects/{project_id}/topics/gmail-new-email"
-    doc_ref = db.collection('gmail_watch').document('expiration')
-    doc = doc_ref.get()
-    now_ms = int(datetime.utcnow().timestamp() * 1000)
-    needs_refresh = True
-    if doc.exists:
-        expiration = doc.to_dict().get('expiration')
-        if expiration and expiration > now_ms + 24*60*60*1000:
-            needs_refresh = False
-    if needs_refresh:
-        print("Refreshing Gmail watch...")
-        response = gmail_service.users().watch(userId='me', body={"topicName": topic_name}).execute()
-        new_expiration = int(response.get('expiration', 0))
-        doc_ref.set({'expiration': new_expiration})
-        print(f"Watch refreshed, new expiration: {new_expiration}")
-
-def extract_time_slots_from_text(text):
-    """Extract time slots mentioned in plain text from other agents or users."""
-    time_slots = []
-    
-    # Common time patterns
-    time_patterns = [
-        r'(\d{1,2}):(\d{2})\s*(AM|PM)\s*(ET|EST|EDT)?',  # 2:30 PM ET
-        r'(\d{1,2}):(\d{2})\s*(am|pm)\s*(ET|EST|EDT)?',  # 2:30 pm ET
-        r'(\d{1,2}):(\d{2})\s*(ET|EST|EDT)',  # 2:30 ET
-        r'(\d{1,2}):(\d{2})',  # 2:30
-    ]
-    
-    # Day patterns
-    day_patterns = [
-        r'(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)',
-        r'(Mon|Tue|Wed|Thu|Fri|Sat|Sun)',
-    ]
-    
-    # Look for combinations of day + time
-    for day_pattern in day_patterns:
-        for time_pattern in time_patterns:
-            # Look for "Day at Time" pattern
-            full_pattern = rf'{day_pattern}\s+(?:at\s+)?{time_pattern}'
-            matches = re.finditer(full_pattern, text, re.IGNORECASE)
-            
-            for match in matches:
-                try:
-                    day_str = match.group(1)
-                    hour = int(match.group(2))
-                    minute = int(match.group(3))
-                    ampm = match.group(4) if len(match.groups()) > 3 else None
-                    
-                    # Convert to 24-hour format
-                    if ampm and ampm.upper() == 'PM' and hour != 12:
-                        hour += 12
-                    elif ampm and ampm.upper() == 'AM' and hour == 12:
-                        hour = 0
-                    
-                    # Find the next occurrence of this day
-                    weekday_map = {
-                        'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3, 'friday': 4,
-                        'mon': 0, 'tue': 1, 'wed': 2, 'thu': 3, 'fri': 4
-                    }
-                    target_weekday = weekday_map.get(day_str.lower())
-                    
-                    if target_weekday is not None:
-                        # Find the next occurrence of this weekday
-                        now_et = datetime.now(ET)
-                        days_ahead = (target_weekday - now_et.weekday()) % 7
-                        if days_ahead == 0:  # Today
-                            days_ahead = 7  # Next week
-                        
-                        target_date = now_et.date() + timedelta(days=days_ahead)
-                        target_time = time(hour, minute)
-                        target_datetime = ET.localize(datetime.combine(target_date, target_time))
-                        
-                        # Only include future times
-                        if target_datetime > now_et:
-                            time_slots.append({
-                                'start': target_datetime.isoformat(),
-                                'duration': 30  # Default duration
-                            })
-                except Exception as e:
-                    print(f"Error parsing time slot from text: {e}")
-                    continue
-    
-    return time_slots
-
-@app.route('/', methods=['POST'])
-def process_email_request():
-    """Entry point for all requests, triggered by Pub/Sub."""
-    
-    envelope = request.get_json()
-    if not envelope or 'message' not in envelope:
-        print('Invalid Pub/Sub message format. This may be a health check.')
-        return 'OK', 200
-    
+def extract_history_id(envelope: dict) -> Optional[str]:
     try:
-        _, project_id = google.auth.default()
-        db = firestore.Client(project=project_id)
-    except google.auth.exceptions.DefaultCredentialsError:
-        print("ERROR: Could not automatically determine project ID.")
-        return "Internal Server Error", 500
+        raw = envelope["message"]["data"]
+        payload = json.loads(base64.b64decode(raw).decode("utf-8"))
+        return str(payload["historyId"])
+    except (KeyError, TypeError, ValueError) as exc:
+        log.warning("Could not read historyId from envelope: %s", exc)
+        return None
 
-    gemini_api_key = os.environ.get("GEMINI_API_KEY")
-    
-    # --- PATCH: Auto-refresh Gmail watch if needed ---
-    creds = authenticate_with_secrets(project_id)
-    if not creds:
-        return "Authentication failed.", 500
-    gmail_service = build('gmail', 'v1', credentials=creds)
-    maybe_refresh_gmail_watch(gmail_service, db, project_id)
+
+# ---------- routes ----------
+
+
+@app.route("/", methods=["POST"])
+def process_notification():
+    error = verify_caller()
+    if error:
+        log.warning("Rejected push request: %s", error)
+        return "Unauthorized", 401
+
+    envelope = request.get_json(silent=True)
+    if not isinstance(envelope, dict) or "message" not in envelope:
+        return "Not a Pub/Sub push message", 200
+
+    history_id = extract_history_id(envelope)
+    if history_id is None:
+        # Malformed and unfixable by retrying; ack it so Pub/Sub stops resending.
+        return "Malformed notification", 200
 
     try:
-        data = json.loads(base64.b64decode(envelope['message']['data']).decode('utf-8'))
-        history_id = str(data['historyId'])
-        doc_ref = db.collection('processed_history').document(history_id)
+        ctx = build_context()
+        outcomes = handler.handle_notification(ctx, history_id)
+    except RetryableError as exc:
+        log.warning("Retryable failure for historyId %s: %s", history_id, exc)
+        return "Retry", 500
+    except Exception as exc:  # noqa: BLE001 - unknown failures are worth a retry
+        log.exception("Unhandled failure for historyId %s", history_id)
+        return f"Error: {type(exc).__name__}", 500
 
-        # --- PATCH: Use Firestore transaction for atomic deduplication ---
-        @firestore.transactional
-        def dedup_transaction(transaction, doc_ref):
-            snapshot = doc_ref.get(transaction=transaction)
-            if snapshot.exists:
-                print(f"Duplicate historyId detected (transaction): {history_id}. Ignoring.")
-                return False
-            transaction.set(doc_ref, {'timestamp': firestore.SERVER_TIMESTAMP})
-            return True
+    for outcome in outcomes:
+        log.info("Outcome: %s", outcome)
+    return json.dumps({"historyId": history_id, "outcomes": outcomes}), 200
 
-        dedup_result = dedup_transaction(db.transaction(), doc_ref)
-        if not dedup_result:
-            return "Duplicate message", 200
 
-    except Exception as e:
-        print(f"Firestore deduplication check failed: {e}")
-        return "Internal Server Error", 500
-
-    sleep_timer.sleep(5)
-    
-    # Remove hardcoded values and fetch from Secret Manager
-    agent_email = get_secret(project_id, "agent-email")
-    owner_email = get_secret(project_id, "owner-email")
-    owner_name = get_secret(project_id, "owner-name")
-
-    creds = authenticate_with_secrets(project_id)
-    if not creds:
-        return "Authentication failed.", 500
+@app.route("/ping", methods=["POST"])
+def ping():
+    error = verify_caller()
+    if error:
+        log.warning("Rejected ping request: %s", error)
+        return "Unauthorized", 401
 
     try:
-        gmail_service = build('gmail', 'v1', credentials=creds)
-        calendar_service = build('calendar', 'v3', credentials=creds)
-    except Exception as e:
-        print(f"CRITICAL: Failed to build API services. Error: {e}")
-        return "Service build failed.", 500
+        ctx = build_context()
+        status = handler.ensure_watch(ctx)
+    except Exception as exc:  # noqa: BLE001 - report the failure to Cloud Scheduler
+        log.exception("Watch renewal failed")
+        return f"Watch renewal failed: {type(exc).__name__}: {exc}", 500
 
-    try:
-        list_response = gmail_service.users().messages().list(userId='me', q='is:unread', maxResults=1).execute()
-        if not list_response.get('messages'):
-            print("No new unread messages found.")
-            return "No unread messages.", 200
-        
-        msg_id = list_response['messages'][0]['id']
-        
-        gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
-        
-        message = gmail_service.users().messages().get(userId='me', id=msg_id, format='full').execute()
-        
-        headers = message['payload']['headers']
-        is_agent_sent = any(h['name'] == 'X-Agent-Processed' and h['value'] == 'true' for h in headers)
-        if is_agent_sent:
-            print(f"Ignoring agent's own message: {msg_id}")
-            return "Agent message ignored.", 200
+    log.info("Ping: %s", status)
+    return status, 200
 
-        subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
-        
-        # Get the current message content
-        current_message_text = get_full_email_body(message['payload'])
-        print(f"Current message text length: {len(current_message_text)}")
-        print(f"Current message preview (first 500 chars): {current_message_text[:500]}")
-        
-        # Get the full thread content by fetching the thread
-        thread_id = message.get('threadId')
-        full_thread_text = current_message_text  # Start with current message
-        
-        if thread_id:
-            try:
-                thread = gmail_service.users().threads().get(userId='me', id=thread_id).execute()
-                print(f"Thread has {len(thread.get('messages', []))} messages")
-                
-                # Combine all messages in the thread
-                for msg in thread.get('messages', []):
-                    if msg['id'] != msg_id:  # Skip current message (already processed)
-                        thread_msg_text = get_full_email_body(msg['payload'])
-                        full_thread_text += "\n\n--- THREAD MESSAGE ---\n\n" + thread_msg_text
-                        print(f"Added thread message: {len(thread_msg_text)} chars")
-            except Exception as e:
-                print(f"Could not fetch full thread: {e}")
-        
-        print(f"Full thread text length: {len(full_thread_text)}")
-        print(f"Full thread preview (first 500 chars): {full_thread_text[:500]}")
-        
-        message_id_header = next((h['value'] for h in headers if h['name'].lower() == 'message-id'), None)
-        references_header = next((h['value'] for h in headers if h['name'].lower() == 'references'), '')
-        new_references = f"{references_header} {message_id_header}".strip()
 
-        original_to = next((h['value'] for h in headers if h['name'].lower() == 'to'), '')
-        original_cc = next((h['value'] for h in headers if h['name'].lower() == 'cc'), '')
-        original_from_header = next((h['value'] for h in headers if h['name'].lower() == 'from'), '')
-        owner_email = owner_email or ""
-        original_to = original_to or ""
-        original_cc = original_cc or ""
-        original_from_header = original_from_header or ""
-        print(f"owner_email: {owner_email}")
-        print(f"original_to: {original_to}")
-        print(f"original_cc: {original_cc}")
-        print(f"original_from_header: {original_from_header}")
-        if owner_email not in (original_to + original_cc + original_from_header):
-            print(f"Owner ({owner_email}) not in participants. Ignoring email.")
-            return "Owner not in thread, request ignored.", 200
-        
-        intent_response = get_conversation_intent_with_ai(full_thread_text, datetime.now(ET), gemini_api_key)
-        intent = intent_response.get("intent")
-        intent_data = intent_response.get("data")
-        print(f"Intent detected: {intent}, proceeding to slot generation...")
+@app.route("/health", methods=["GET"])
+def health():
+    return "OK", 200
 
-        # --- PATCH: Add robust debug and exception logging for INITIAL_REQUEST ---
-        if intent == "INITIAL_REQUEST":
-            try:
-                print("[DEBUG] INITIAL_REQUEST: About to generate slots...")
-                preferences = intent_data or {}
-                available_slots = find_available_slots(calendar_service, owner_email, preferences)
-                print(f"[DEBUG] INITIAL_REQUEST: Available slots: {available_slots}")
 
-                all_emails_str = original_to + "," + original_cc + "," + original_from_header
-                all_emails = list(set(re.findall(r'[\w\.+-]+@[\w\.-]+\.[\w\.-]+', all_emails_str)))
-                participants = [email for email in all_emails if email not in [agent_email, owner_email]]
-                to_field = ", ".join(participants)
-                cc_field = owner_email
-
-                print(f"[DEBUG] INITIAL_REQUEST: To field: {to_field}, CC field: {cc_field}")
-
-                if not participants:
-                    print("[DEBUG] INITIAL_REQUEST: No valid participants found for To field. Using original sender as recipient.")
-                    sender_match = re.search(r'[\w\.+-]+@[\w\.-]+\.[\w\.-]+', original_from_header)
-                    if sender_match:
-                        to_field = sender_match.group(0)
-                    else:
-                        print("[DEBUG] INITIAL_REQUEST: Could not extract sender email. Aborting send.")
-                        return "No valid recipient found.", 500
-
-                # Compose slots text and hidden data
-                slots_text = ""
-                hidden_data_for_body = ""
-                
-                # Group slots by day for better presentation
-                slots_by_day = {}
-                for slot_data in available_slots:
-                    slot_et = slot_data['slot']
-                    day_key = slot_et.strftime('%A, %B %d')
-                    if day_key not in slots_by_day:
-                        slots_by_day[day_key] = []
-                    slots_by_day[day_key].append(slot_data)
-                
-                # Format slots grouped by day with proper HTML
-                slots_html = ""
-                for day, day_slots in slots_by_day.items():
-                    slots_html += f"<p><strong>{day}:</strong></p>"
-                    slots_html += "<ul style='margin: 10px 0; padding-left: 20px;'>"
-                    for slot_data in day_slots:
-                        slot_et = slot_data['slot']
-                        slots_html += f"<li style='margin: 5px 0;'>{slot_et.strftime('%I:%M %p ET')}</li>"
-                        hidden_info = json.dumps({'start': slot_et.isoformat(), 'duration': slot_data['duration']})
-                        hidden_data_for_body += f"<!-- data: {hidden_info} -->\n"
-                        hidden_data_for_body += f'<span style="display:none;">SLOT_DATA:{hidden_info}</span>\n'
-                    slots_html += "</ul>"
-                
-                # Plain text version for AI prompt
-                for day, day_slots in slots_by_day.items():
-                    slots_text += f"\n{day}:\n"
-                    for slot_data in day_slots:
-                        slot_et = slot_data['slot']
-                        slots_text += f"  • {slot_et.strftime('%I:%M %p ET')}\n"
-
-                # --- PATCH: Extract recipient first name from signature if present ---
-                # Try to find a signature block in the current message
-                signature_match = re.search(r'-- ?\\n([A-Za-z]+)', current_message_text)
-                if signature_match:
-                    greeting_name = signature_match.group(1)
-                else:
-                    # Fallback to previous logic (extract from email headers)
-                    recipient_names = []
-                    for email in participants:
-                        try:
-                            # Use a robust regex for name extraction, ensure all parentheses are closed
-                            pattern = r'([\w\s\"\']+)\s*<\s*' + re.escape(email) + r'\s*>'
-                            name_match = re.search(pattern, original_to + "," + original_cc + "," + original_from_header, re.IGNORECASE)
-                        except Exception as e:
-                            print(f"Regex error in recipient name extraction: {e}")
-                            name_match = None
-                        if name_match:
-                            name = name_match.group(1).replace('"', '').replace("'", '').strip()
-                            recipient_names.append(name)
-                        else:
-                            recipient_names.append(email)
-                    greeting_name = recipient_names[0] if recipient_names else ""
-                if not greeting_name or greeting_name.lower() == 'hi':
-                    greeting_name = "Hi"
-
-                # --- In all agent email composition (INITIAL_REQUEST, OTHER, etc):
-                # 1. Remove greeting_template, greeting_name, and Gemini greeting prompt logic.
-                # 2. Only ask Gemini for the main body (slot list, instructions, etc.).
-                # 3. Always prepend 'Hi<br><br>' to the email body in the HTML.
-                # Get the duration from the first slot (they should all have the same duration)
-                meeting_duration = available_slots[0]['duration'] if available_slots else 30
-                
-                # --- In all agent email composition (INITIAL_REQUEST, OTHER, etc):
-                # 1. Remove greeting_template, greeting_name, and Gemini greeting prompt logic.
-                # 2. Only ask Gemini for the main body (slot list, instructions, etc.).
-                # 3. Always prepend 'Hi<br><br>' to the email body in the HTML.
-                prompt = f"""
-                You are a helpful AI assistant for {owner_name}.
-                Write a brief, friendly, and natural-sounding email to propose meeting times for a {meeting_duration}-minute meeting. Do NOT include a greeting or recipient name. The available time slots are:
-                {slots_text}
-                Your response should be conversational and not robotic. Mention the meeting duration ({meeting_duration} minutes) in your response. Do NOT include a subject line or greeting. End by saying something like, 'Let me know if any of these work for you!'
-                """
-                genai.configure(api_key=gemini_api_key)
-                model = genai.GenerativeModel('gemini-2.5-flash')
-                email_response = model.generate_content(prompt)
-                email_body_text = email_response.text
-
-                # --- PATCH: Professional agent signature ---
-                html_body = f"""
-                <html><body>
-                <p>Hi<br><br>
-                I'd love to schedule our {meeting_duration}-minute meeting! How about one of these times?</p>
-                {slots_html}
-                <p>Let me know if any of these work for you!</p>
-                {hidden_data_for_body}
-                <div style='margin-top:32px; margin-bottom:8px; border-top:1px solid #e0e0e0;'></div>
-                <div style='color:#222; font-size:13px; font-family:sans-serif; margin-top:8px;'>
-                  <strong>Anntao's AI Assistant</strong><br>
-                  <span style='color:#888;'>on behalf of {owner_name}</span>
-                </div>
-                </body></html>
-                """
-
-                clean_subject = f"Re: {subject.replace('Re: ', '')}"
-                email_message = create_threaded_email(agent_email, to_field, cc_field, clean_subject, html_body, in_reply_to=message_id_header, references=new_references)
-                send_email(gmail_service, 'me', email_message, thread_id=thread_id)
-                print(f"[DEBUG] INITIAL_REQUEST: Sent time slot suggestions to {to_field}")
-                gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
-                print(f"[DEBUG] INITIAL_REQUEST: Marked message {msg_id} as read and set historyId {history_id}")
-            except Exception as e:
-                import traceback
-                print(f"[ERROR] Exception in INITIAL_REQUEST branch: {e}")
-                traceback.print_exc()
-                return "Error in INITIAL_REQUEST", 500
-
-        elif intent == "CONFIRMATION":
-            print("AI detected CONFIRMATION intent.")
-            confirmed_start_time_iso = None
-            if intent_data and isinstance(intent_data, dict):
-                confirmed_start_time_iso = intent_data.get('confirmed_start_time_iso')
-
-            if confirmed_start_time_iso:
-                print(f"AI returned confirmed time: {confirmed_start_time_iso}")
-                # Search for both HTML comments and invisible spans
-                hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', full_thread_text)
-                slot_data_matches = re.findall(r'SLOT_DATA:(.*?)</span>', full_thread_text)
-                
-                # Combine both types of matches
-                all_hidden_matches = hidden_data_matches + slot_data_matches
-                print(f"Found {len(hidden_data_matches)} HTML comment matches and {len(slot_data_matches)} span matches")
-                print(f"Total hidden data matches: {len(all_hidden_matches)}")
-                
-                # Also search for time slots in plain text (for agent-to-agent communication)
-                text_time_slots = extract_time_slots_from_text(full_thread_text)
-                print(f"Found {len(text_time_slots)} time slots in plain text")
-                
-                # Convert text time slots to the same format as hidden data
-                for slot in text_time_slots:
-                    all_hidden_matches.append(json.dumps(slot))
-                
-                # Debug: search for any HTML comments
-                all_comments = re.findall(r'<!--.*?-->', full_thread_text)
-                print(f"Total HTML comments found: {len(all_comments)}")
-                for i, comment in enumerate(all_comments[:3]):  # Show first 3 comments
-                    print(f"Comment {i+1}: {comment}")
-                
-                # Debug: search for "data:" anywhere in the text
-                all_comments = re.findall(r'<!--.*?-->', full_thread_text)
-                print(f"Total HTML comments found: {len(all_comments)}")
-                for i, comment in enumerate(all_comments[:3]):  # Show first 3 comments
-                    print(f"Comment {i+1}: {comment}")
-                
-                duration = 30
-                found_match = False
-                
-                # Parse the confirmed time from AI
-                try:
-                    confirmed_dt = datetime.fromisoformat(confirmed_start_time_iso)
-                    if confirmed_dt.tzinfo is None:
-                        # If no timezone info, assume it's in ET
-                        confirmed_dt = ET.localize(confirmed_dt)
-                    else:
-                        # Convert to ET
-                        confirmed_dt = confirmed_dt.astimezone(ET)
-                    confirmed_dt_rounded = confirmed_dt.replace(second=0, microsecond=0)
-                    print(f"Parsed confirmed time (ET): {confirmed_dt_rounded}")
-                except Exception as e:
-                    print(f"Error parsing confirmed time: {e}")
-                    return "Error parsing confirmed time", 500
-
-                for i, hidden_info_str in enumerate(all_hidden_matches):
-                    try:
-                        event_data = json.loads(hidden_info_str)
-                        print(f"Hidden data {i+1}: {event_data}")
-                        
-                        event_dt = datetime.fromisoformat(event_data['start'])
-                        if event_dt.tzinfo is None:
-                            # If no timezone info, assume it's in ET
-                            event_dt = ET.localize(event_dt)
-                        else:
-                            # Convert to ET
-                            event_dt = event_dt.astimezone(ET)
-                        event_dt_rounded = event_dt.replace(second=0, microsecond=0)
-                        
-                        # --- PATCH: Robust slot confirmation matching (±5 min) ---
-                        delta = abs((confirmed_dt_rounded - event_dt_rounded).total_seconds())
-                        print(f"Comparing: AI='{confirmed_dt_rounded}' vs Option='{event_dt_rounded}' (delta: {delta} seconds)")
-                        if delta <= 5 * 60:
-                            duration = event_data['duration']
-                            found_match = True
-                            print(f"Found matching slot! Duration: {duration} minutes")
-                            break
-                    except Exception as e:
-                        print(f"Error parsing hidden data {i+1}: {e}")
-                        continue
-                
-                if found_match:
-                    # Use the confirmed datetime directly since we already parsed it
-                    start_time_et = confirmed_dt
-                    all_emails_str = original_to + "," + original_cc + "," + original_from_header
-                    attendees = list(set(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', all_emails_str)))
-                    attendees = [email for email in attendees if email != agent_email]
-                    if owner_email not in attendees:
-                        attendees.append(owner_email)
-
-                    create_calendar_event(calendar_service, owner_email, f"Meeting: {subject.replace('Re: ', '')}", start_time_et, duration, attendees)
-                    print(f"Event scheduled with {', '.join(attendees)}")
-                    
-                    # Send confirmation email to the thread
-                    confirmation_html = f"""
-                    <html><body>
-                    <p>Hi<br><br>
-                    Perfect! I've scheduled the {duration}-minute meeting for {start_time_et.strftime('%A, %B %d at %I:%M %p ET')}.<br><br>
-                    A calendar invite has been sent to all participants. Looking forward to our meeting!<br><br>
-                    Best regards,<br>
-                    {owner_name}
-                    </p>
-                    <div style='margin-top:32px; margin-bottom:8px; border-top:1px solid #e0e0e0;'></div>
-                    <div style='color:#222; font-size:13px; font-family:sans-serif; margin-top:8px;'>
-                      <strong>Anntao's AI Assistant</strong><br>
-                      <span style='color:#888;'>on behalf of {owner_name}</span>
-                    </div>
-                    </body></html>
-                    """
-                    
-                    # Determine recipients for confirmation email
-                    all_emails_str = original_to + "," + original_cc + "," + original_from_header
-                    all_emails = list(set(re.findall(r'[\w\.+-]+@[\w\.-]+\.[\w\.-]+', all_emails_str)))
-                    participants = [email for email in all_emails if email not in [agent_email, owner_email]]
-                    to_field = ", ".join(participants) if participants else original_from_header
-                    cc_field = owner_email if owner_email not in participants else ""
-                    
-                    clean_subject = f"Re: {subject.replace('Re: ', '')}"
-                    confirmation_message = create_threaded_email(agent_email, to_field, cc_field, clean_subject, confirmation_html, in_reply_to=message_id_header, references=new_references)
-                    send_email(gmail_service, 'me', confirmation_message, thread_id=thread_id)
-                    print(f"Sent confirmation email to {to_field}")
-                    
-                    doc_ref.set({'timestamp': firestore.SERVER_TIMESTAMP})
-                    gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
-                    print(f"Marked message {msg_id} as read and set historyId {history_id}")
-                else:
-                    print(f"AI confirmed a time ({confirmed_start_time_iso}), but it was not one of the options offered. Ignoring.")
-                    print(f"Available options were: {[datetime.fromisoformat(json.loads(match)['start']).astimezone(ET).strftime('%Y-%m-%d %H:%M ET') for match in hidden_data_matches]}")
-
-        elif intent == "DAY_CONFIRMATION":
-            print("AI detected DAY_CONFIRMATION intent.")
-            day_name = None
-            time_of_day = None
-            if intent_data and isinstance(intent_data, dict):
-                day_name = intent_data.get('day_name')
-                time_of_day = intent_data.get('time_of_day')
-
-            if day_name:
-                print(f"User confirmed day: {day_name}, time preference: {time_of_day}")
-                # Search for both HTML comments and invisible spans
-                hidden_data_matches = re.findall(r'<!-- data: (.*?) -->', full_thread_text)
-                slot_data_matches = re.findall(r'SLOT_DATA:(.*?)</span>', full_thread_text)
-                
-                # Combine both types of matches
-                all_hidden_matches = hidden_data_matches + slot_data_matches
-                print(f"Found {len(hidden_data_matches)} HTML comment matches and {len(slot_data_matches)} span matches")
-                print(f"Total hidden data matches: {len(all_hidden_matches)}")
-                
-                # Find the next occurrence of this day
-                weekday_map = {
-                    'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3, 'friday': 4
-                }
-                target_weekday = weekday_map.get(day_name.lower())
-                
-                if target_weekday is None:
-                    print(f"Invalid day name: {day_name}")
-                    return "Invalid day name", 400
-                
-                # Find matching slots for this day
-                matching_slots = []
-                for hidden_info_str in all_hidden_matches:
-                    try:
-                        event_data = json.loads(hidden_info_str)
-                        event_dt = datetime.fromisoformat(event_data['start'])
-                        if event_dt.tzinfo is None:
-                            event_dt = ET.localize(event_dt)
-                        else:
-                            event_dt = event_dt.astimezone(ET)
-                        
-                        # Check if this slot is on the target day
-                        if event_dt.weekday() == target_weekday:
-                            # If user specified time_of_day preference, filter by that
-                            if time_of_day:
-                                hour = event_dt.hour
-                                if time_of_day == "morning" and hour >= 12:
-                                    continue
-                                elif time_of_day == "afternoon" and hour < 12:
-                                    continue
-                            
-                            matching_slots.append({
-                                'datetime': event_dt,
-                                'duration': event_data['duration']
-                            })
-                    except Exception as e:
-                        print(f"Error parsing hidden data: {e}")
-                        continue
-                
-                if matching_slots:
-                    # Sort by time and take the first one
-                    matching_slots.sort(key=lambda x: x['datetime'])
-                    selected_slot = matching_slots[0]
-                    
-                    print(f"Selected slot for {day_name}: {selected_slot['datetime'].strftime('%A, %B %d at %I:%M %p ET')}")
-                    
-                    # Schedule the meeting
-                    all_emails_str = original_to + "," + original_cc + "," + original_from_header
-                    attendees = list(set(re.findall(r'[\w\.\+-]+@[\w\.-]+\.[\w\.-]+', all_emails_str)))
-                    attendees = [email for email in attendees if email != agent_email]
-                    if owner_email not in attendees:
-                        attendees.append(owner_email)
-
-                    create_calendar_event(calendar_service, owner_email, f"Meeting: {subject.replace('Re: ', '')}", 
-                                       selected_slot['datetime'], selected_slot['duration'], attendees)
-                    print(f"Event scheduled with {', '.join(attendees)}")
-                    
-                    # Send confirmation email to the thread
-                    confirmation_html = f"""
-                    <html><body>
-                    <p>Hi<br><br>
-                    Perfect! I've scheduled the {selected_slot['duration']}-minute meeting for {selected_slot['datetime'].strftime('%A, %B %d at %I:%M %p ET')}.<br><br>
-                    A calendar invite has been sent to all participants. Looking forward to our meeting!<br><br>
-                    Best regards,<br>
-                    {owner_name}
-                    </p>
-                    <div style='margin-top:32px; margin-bottom:8px; border-top:1px solid #e0e0e0;'></div>
-                    <div style='color:#222; font-size:13px; font-family:sans-serif; margin-top:8px;'>
-                      <strong>Anntao's AI Assistant</strong><br>
-                      <span style='color:#888;'>on behalf of {owner_name}</span>
-                    </div>
-                    </body></html>
-                    """
-                    
-                    # Determine recipients for confirmation email
-                    all_emails_str = original_to + "," + original_cc + "," + original_from_header
-                    all_emails = list(set(re.findall(r'[\w\.+-]+@[\w\.-]+\.[\w\.-]+', all_emails_str)))
-                    participants = [email for email in all_emails if email not in [agent_email, owner_email]]
-                    to_field = ", ".join(participants) if participants else original_from_header
-                    cc_field = owner_email if owner_email not in participants else ""
-                    
-                    clean_subject = f"Re: {subject.replace('Re: ', '')}"
-                    confirmation_message = create_threaded_email(agent_email, to_field, cc_field, clean_subject, confirmation_html, in_reply_to=message_id_header, references=new_references)
-                    send_email(gmail_service, 'me', confirmation_message, thread_id=thread_id)
-                    print(f"Sent confirmation email to {to_field}")
-                    
-                    doc_ref.set({'timestamp': firestore.SERVER_TIMESTAMP})
-                    gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
-                    print(f"Marked message {msg_id} as read and set historyId {history_id}")
-                else:
-                    print(f"No available slots found for {day_name} with time preference: {time_of_day}")
-            else:
-                print("AI detected DAY_CONFIRMATION but no day_name provided")
-
-        # --- IMPROVEMENT: Handle 'none of these work' replies ---
-        elif intent == "OTHER":
-            print("AI detected OTHER intent. Checking for new preferences.")
-            # Try to extract new preferences from the AI (reuse INITIAL_REQUEST logic)
-            preferences = {'duration': 30}
-            # Ask Gemini to extract new preferences if present, including time and time zone
-            try:
-                genai.configure(api_key=gemini_api_key)
-                model = genai.GenerativeModel('gemini-2.5-flash')
-                pref_prompt = f"""
-                The user replied that none of the offered times work, or is proposing a new time. Please extract any new preferences for meeting time (such as preferred days, times, durations, or specific times) from the following email. If the user mentions a specific time (e.g., '4pm Paris'), extract both the time and the time zone/city if present. If no new preferences are found, return an empty object.
-                
-                CRITICAL: Pay special attention to future date requests:
-                * If user mentions "next week", calculate the start of next week (Monday) and set start_date to that date in YYYY-MM-DD format
-                * If user mentions specific dates like "August 5th" or "August 5th or 6th", extract the earliest mentioned date as start_date in YYYY-MM-DD format
-                * If user mentions relative dates like "next Monday", "next Tuesday", calculate the actual date and set start_date
-                * For specific dates, assume current year unless explicitly stated otherwise
-                
-                Email:
-                '''
-                {current_message_text}
-                '''
-                Respond with a JSON object with possible keys: duration, day_preference, time_of_day, start_date, specific_time (ISO 8601), time_zone (IANA tz name or city).
-                """
-                pref_response = model.generate_content(pref_prompt)
-                print(f"AI preference extraction response: {pref_response.text}")
-                pref_json = pref_response.text.strip().replace('```json', '').replace('```', '').strip()
-                new_prefs = json.loads(pref_json)
-                if new_prefs:
-                    preferences.update(new_prefs)
-            except Exception as e:
-                print(f"Could not extract new preferences: {e}")
-            print(f"Preferences for slot search: {preferences}")
-
-            # --- PATCH: Handle specific_time and time_zone conversion ---
-            user_time_et = None
-            if preferences.get('specific_time'):
-                user_time_str = preferences['specific_time']
-                if not isinstance(user_time_str, str):
-                    user_time_str = str(user_time_str)
-                user_tz = preferences.get('time_zone', 'America/New_York')
-                if not isinstance(user_tz, str):
-                    user_tz = str(user_tz)
-                try:
-                    dt = dtparser.parse(user_time_str)
-                    if dt.tzinfo is None:
-                        # Try to localize to user_tz if possible
-                        try:
-                            if not isinstance(user_tz, str):
-                                user_tz = str(user_tz)
-                            tz = pytz.timezone(user_tz)
-                        except Exception:
-                            # Try to map city to tz
-                            city_map = {'Paris': 'Europe/Paris', 'London': 'Europe/London', 'New York': 'America/New_York'}
-                            tz_name = city_map.get(str(user_tz), 'America/New_York')
-                            try:
-                                tz = pytz.timezone(str(tz_name))
-                            except Exception:
-                                tz = pytz.timezone('America/New_York')
-                        dt = tz.localize(dt)
-                    user_time_et = dt.astimezone(ET)
-                    print(f"User proposed time in ET: {user_time_et}")
-                    # Propose this slot if available
-                    available_slots = [{'slot': user_time_et, 'duration': preferences.get('duration', 30)}]
-                except Exception as e:
-                    print(f"Could not parse or convert user time: {e}")
-                    # Fallback to normal slot search
-                    available_slots = find_available_slots(calendar_service, owner_email, preferences)
-            else:
-                available_slots = find_available_slots(calendar_service, owner_email, preferences)
-            print(f"Available slots: {available_slots}")
-
-            if not available_slots:
-                # Fallback: offer a default slot tomorrow at 10am
-                print("No available slots found, offering default slot.")
-                tomorrow = datetime.now(ET) + timedelta(days=1)
-                default_slot = ET.localize(datetime.combine(tomorrow.date(), time(10, 0)))
-                available_slots = [{"slot": default_slot, "duration": 30}]
-
-            slots_text = ""
-            hidden_data_for_body = ""
-            
-            # Group slots by day for better presentation (same as INITIAL_REQUEST)
-            slots_by_day = {}
-            for slot_data in available_slots:
-                slot_et = slot_data['slot']
-                day_key = slot_et.strftime('%A, %B %d')
-                if day_key not in slots_by_day:
-                    slots_by_day[day_key] = []
-                slots_by_day[day_key].append(slot_data)
-            
-            # Format slots grouped by day with proper HTML
-            slots_html = ""
-            for day, day_slots in slots_by_day.items():
-                slots_html += f"<p><strong>{day}:</strong></p>"
-                slots_html += "<ul style='margin: 10px 0; padding-left: 20px;'>"
-                for slot_data in day_slots:
-                    slot_et = slot_data['slot']
-                    # If user proposed a time and a zone, show both ET and user's zone
-                    if user_time_et and preferences.get('time_zone'):
-                        try:
-                            user_tz = pytz.timezone(str(preferences['time_zone']))
-                            slot_user_tz = slot_et.astimezone(user_tz)
-                            slots_html += f"<li style='margin: 5px 0;'>{slot_user_tz.strftime('%I:%M %p')} {preferences['time_zone']} / {slot_et.strftime('%I:%M %p ET')}</li>"
-                        except Exception:
-                            slots_html += f"<li style='margin: 5px 0;'>{slot_et.strftime('%I:%M %p ET')}</li>"
-                    else:
-                        slots_html += f"<li style='margin: 5px 0;'>{slot_et.strftime('%I:%M %p ET')}</li>"
-                slots_html += "</ul>"
-            
-            # Plain text version for AI prompt
-            for day, day_slots in slots_by_day.items():
-                slots_text += f"\n{day}:\n"
-                for slot_data in day_slots:
-                    slot_et = slot_data['slot']
-                    # If user proposed a time and a zone, show both ET and user's zone
-                    if user_time_et and preferences.get('time_zone'):
-                        try:
-                            user_tz = pytz.timezone(str(preferences['time_zone']))
-                            slot_user_tz = slot_et.astimezone(user_tz)
-                            slots_text += f"  • {slot_user_tz.strftime('%I:%M %p')} {preferences['time_zone']} / {slot_et.strftime('%I:%M %p ET')}\n"
-                        except Exception:
-                            slots_text += f"  • {slot_et.strftime('%I:%M %p ET')}\n"
-                    else:
-                        slots_text += f"  • {slot_et.strftime('%I:%M %p ET')}\n"
-
-            all_emails_str = original_to + "," + original_cc + "," + original_from_header
-            all_emails = list(set(re.findall(r'[\w\.+-]+@[\w\.-]+\.[\w\.-]+', all_emails_str)))
-            participants = [email for email in all_emails if email not in [agent_email, owner_email]]
-            to_field = ", ".join(participants)
-            cc_field = owner_email
-
-            if not participants:
-                print("No valid participants found for To field. Using original sender as recipient.")
-                # Try to extract sender from original_from_header
-                sender_match = re.search(r'[\w\.+-]+@[\w\.-]+\.[\w\.-]+', original_from_header)
-                if sender_match:
-                    to_field = sender_match.group(0)
-                else:
-                    print("Could not extract sender email. Aborting send.")
-                    return "No valid recipient found.", 500
-
-            print(f"To field: {to_field}, CC field: {cc_field}")
-
-            try:
-                genai.configure(api_key=gemini_api_key)
-                model = genai.GenerativeModel('gemini-2.5-flash')
-                # --- In all agent email composition (INITIAL_REQUEST, OTHER, etc):
-                # 1. Remove greeting_template, greeting_name, and Gemini greeting prompt logic.
-                # 2. Only ask Gemini for the main body (slot list, instructions, etc.).
-                # 3. Always prepend 'Hi<br><br>' to the email body in the HTML.
-                # Get the duration from the first slot (they should all have the same duration)
-                meeting_duration = available_slots[0]['duration'] if available_slots else 30
-                
-                prompt = f"""
-                You are a helpful AI assistant for {owner_name}.
-                Write a brief, friendly, and natural-sounding email to propose meeting times for a {meeting_duration}-minute meeting. Do NOT include a greeting or recipient name. The available time slots are:
-                {slots_text}
-                Your response should be conversational and not robotic. Mention the meeting duration ({meeting_duration} minutes) in your response. Do NOT include a subject line or greeting. End by saying something like, 'Let me know if any of these work for you!'
-                """
-                email_response = model.generate_content(prompt)
-                email_body_text = email_response.text
-
-                # --- PATCH: Consistent professional signature and simplified greeting for all agent emails ---
-                # Replace all email body composition (INITIAL_REQUEST, OTHER, etc) with:
-                # greeting_line = 'Hi'<br><br> + email_body_text
-                # signature_html = ... (the new professional signature)
-                # html_body = f"<html><body><p>{greeting_line}{email_body_text.replace(os.linesep, '<br>')}</p>{hidden_data_for_body}{signature_html}</body></html>"
-                signature_html = f"""
-                <div style='margin-top:32px; margin-bottom:8px; border-top:1px solid #e0e0e0;'></div>
-                <div style='color:#222; font-size:13px; font-family:sans-serif; margin-top:8px;'>
-                  <strong>Anntao's AI Assistant</strong><br>
-                  <span style='color:#888;'>on behalf of {owner_name}</span>
-                </div>
-                """
-                html_body = f"""
-                <html><body>
-                <p>Hi<br><br>
-                Here are some alternative times for our {meeting_duration}-minute meeting:</p>
-                {slots_html}
-                <p>Let me know if any of these work for you!</p>
-                {hidden_data_for_body}
-                {signature_html}
-                </body></html>
-                """
-
-                clean_subject = f"Re: {subject.replace('Re: ', '')}"
-                email_message = create_threaded_email(agent_email, to_field, cc_field, clean_subject, html_body, in_reply_to=message_id_header, references=new_references)
-                send_email(gmail_service, 'me', email_message, thread_id=thread_id)
-                print(f"Sent time slot suggestions to {to_field}")
-                doc_ref.set({'timestamp': firestore.SERVER_TIMESTAMP})
-                gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
-                print(f"Marked message {msg_id} as read and set historyId {history_id}")
-            except Exception as e:
-                print(f"Exception during slot suggestion or email send: {e}")
-                return "Error sending email.", 500
-
-        # --- NEW: Handle IGNORE intent - agent stays silent ---
-        elif intent == "IGNORE":
-            print("AI detected IGNORE intent. Conversation is not about scheduling. Agent will stay silent.")
-            # Mark message as read but don't send any response
-            gmail_service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
-            print(f"Marked message {msg_id} as read and set historyId {history_id} (no response sent)")
-            return "Conversation not about scheduling - agent staying silent", 200
-
-    except Exception as e:
-        import traceback
-        print(f"An error occurred during processing: {e}")
-        traceback.print_exc()
-        return "An error occurred.", 500
-
-    return "Processing complete.", 200
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint for Cloud Run."""
-    return 'OK', 200
-
-@app.route('/ping', methods=['POST'])
-def ping_refresh_gmail_watch():
-    """Ping endpoint to refresh Gmail watch, called by Cloud Scheduler."""
-    try:
-        print("PING: Starting ping endpoint...")
-        
-        # Step 1: Test basic functionality
-        print("PING: Step 1 - Basic endpoint test")
-        
-        # Step 2: Test project ID determination
-        try:
-            _, project_id = google.auth.default()
-            print(f"PING: Step 2 - Project ID determined: {project_id}")
-        except Exception as e:
-            print(f"PING ERROR: Failed to get project ID: {e}")
-            return f"Project ID error: {str(e)}", 500
-        
-        # Step 3: Test Firestore client
-        try:
-            db = firestore.Client(project=project_id)
-            print("PING: Step 3 - Firestore client created successfully")
-        except Exception as e:
-            print(f"PING ERROR: Failed to create Firestore client: {e}")
-            return f"Firestore error: {str(e)}", 500
-        
-        # Step 4: Test authentication
-        try:
-            print("PING: Step 4 - Attempting to authenticate with secrets...")
-            creds = authenticate_with_secrets(project_id)
-            if not creds:
-                print("PING ERROR: Authentication failed")
-                return "Authentication failed.", 500
-            print("PING: Step 4 - Authentication successful")
-        except Exception as e:
-            print(f"PING ERROR: Authentication exception: {e}")
-            return f"Authentication exception: {str(e)}", 500
-        
-        # Step 5: Test Gmail service
-        try:
-            print("PING: Step 5 - Building Gmail service...")
-            gmail_service = build('gmail', 'v1', credentials=creds)
-            print("PING: Step 5 - Gmail service built successfully")
-        except Exception as e:
-            print(f"PING ERROR: Failed to build Gmail service: {e}")
-            return f"Gmail service error: {str(e)}", 500
-        
-        # Step 6: Test watch refresh
-        try:
-            print("PING: Step 6 - Calling maybe_refresh_gmail_watch...")
-            maybe_refresh_gmail_watch(gmail_service, db, project_id)
-            print("PING: Step 6 - maybe_refresh_gmail_watch completed successfully")
-        except Exception as e:
-            print(f"PING ERROR: Watch refresh failed: {e}")
-            return f"Watch refresh error: {str(e)}", 500
-        
-        print("PING: All steps completed successfully!")
-        return "Ping: Gmail watch checked/refreshed.", 200
-        
-    except Exception as e:
-        print(f"PING ERROR: Unexpected exception: {e}")
-        import traceback
-        traceback.print_exc()
-        return f"Unexpected error: {str(e)}", 500
-
-# This block is essential for the server to start.
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(debug=True, host='0.0.0.0', port=port)
+    # debug is off unless FLASK_DEBUG is set. The Werkzeug debugger is remote
+    # code execution for anyone who can reach the port, and this binds 0.0.0.0.
+    app.run(
+        debug=config.debug_enabled(),
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8080)),
+    )
